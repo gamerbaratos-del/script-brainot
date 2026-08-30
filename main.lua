@@ -1,5 +1,3 @@
--- Script ajustado removendo os botões de ativar/desativar voo
-
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
@@ -82,7 +80,7 @@ local function getInputDirection()
     return direction
 end
 
--- Função para criar UI
+-- Função para criar UI (sem botões, apenas o painel)
 local function createUI()
     local oldGui = playerGui:FindFirstChild("FlyControlUI")
     if oldGui then
@@ -131,24 +129,6 @@ local function createUI()
     titleText.TextXAlignment = Enum.TextXAlignment.Left
     titleText.Parent = titleBar
 
-    -- Botão de minimizar (mantido, se desejar)
-    local minimizeBtn = Instance.new("TextButton")
-    minimizeBtn.Name = "MinimizeBtn"
-    minimizeBtn.Size = UDim2.new(0, 40, 0, 40)
-    minimizeBtn.Position = UDim2.new(1, -45, 0, 5)
-    minimizeBtn.BackgroundColor3 = Color3.fromRGB(240, 100, 100)
-    minimizeBtn.BorderSizePixel = 0
-    minimizeBtn.AutoButtonColor = false
-    minimizeBtn.Text = "−"
-    minimizeBtn.Font = Enum.Font.GothamBold
-    minimizeBtn.TextSize = 20
-    minimizeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    minimizeBtn.Parent = titleBar
-
-    local minimizeCorner = Instance.new("UICorner")
-    minimizeCorner.CornerRadius = UDim.new(0, 8)
-    minimizeCorner.Parent = minimizeBtn
-
     -- Container para sliders
     local sliderContainer = Instance.new("Frame")
     sliderContainer.Name = "SliderContainer"
@@ -186,7 +166,6 @@ local function createUI()
         ScreenGui = screenGui,
         Panel = panel,
         TitleBar = titleBar,
-        MinimizeBtn = minimizeBtn,
         SliderContainer = sliderContainer,
         StatusDot = statusDot,
         StatusLabel = statusLabel
@@ -298,13 +277,7 @@ end
 -- Funções de voo
 local function setUIFlying(state)
     local tweenInfo = TweenInfo.new(0.25, Enum.EasingStyle.Quad)
-
-    if state then
-        -- Aqui você pode ajustar a UI para indicar que está ativo (se necessário)
-        -- Como removemos o botão de ativar/desativar, essa função pode ficar vazia ou ajustar cores
-    else
-        -- Aqui também
-    end
+    -- Como removemos os botões, essa função pode ficar vazia ou ajustar cores se desejar
 end
 
 local function enableFly()
@@ -366,34 +339,7 @@ end
 
 -- Movimento do painel
 local function setupPanelDrag()
-    uiElements.Panel.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 then
-            flyState.dragging = true
-            flyState.dragStart = input.Position
-            flyState.panelStartPos = uiElements.Panel.Position
-        end
-    end)
-
-    UserInputService.InputChanged:Connect(function(input)
-        if flyState.dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-            local delta = input.Position - flyState.dragStart
-            uiElements.Panel.Position = UDim2.new(
-                flyState.panelStartPos.X.Scale,
-                flyState.panelStartPos.X.Offset + delta.X,
-                flyState.panelStartPos.Y.Scale,
-                flyState.panelStartPos.Y.Offset + delta.Y
-            )
-            if flyState.minimized then
-                flyState.lastMinimizedPos = uiElements.Panel.Position
-            end
-        end
-    end)
-
-    UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 then
-            flyState.dragging = false
-        end
-    end)
+    -- Como removemos o painel, essa função pode ser eliminada ou deixada vazia
 end
 
 -- Inicialização
@@ -413,7 +359,7 @@ local function setup()
         applyCharacterValues()
     end)
 
-    setupPanelDrag()
+    -- Sem painel para arrastar, então removemos setupPanelDrag()
 
     -- Tecla de atalho para ativar/desativar voo
     UserInputService.InputBegan:Connect(function(input, gameProcessed)
