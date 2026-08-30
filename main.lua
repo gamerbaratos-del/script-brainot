@@ -1,3 +1,4 @@
+-- Script ajustado e integrado com painel completo e botões
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
@@ -11,7 +12,6 @@ local flyState = {
     bodyVel = nil,
     bodyGyro = nil,
     dragging = false,
-    dragStart = nil,
     panelStartPos = nil,
     minimized = false,
     lastMinimizedPos = UDim2.new(0, 20, 0.5, -25)
@@ -103,7 +103,7 @@ local function createUI()
     panel.ClipsDescendants = true
     panel.Parent = screenGui
 
-    -- Adicionando cantos arredondados
+    -- Cantos arredondados
     local corner = Instance.new("UICorner")
     corner.CornerRadius = UDim.new(0, 16)
     corner.Parent = panel
@@ -166,7 +166,7 @@ local function createUI()
     btnCorner.CornerRadius = UDim.new(0, 12)
     btnCorner.Parent = toggleFlyBtn
 
-    -- Slider container
+    -- Container para sliders
     local sliderContainer = Instance.new("Frame")
     sliderContainer.Name = "SliderContainer"
     sliderContainer.Size = UDim2.new(1, 0, 1, -150)
@@ -186,7 +186,7 @@ local function createUI()
     statusDotCorner.CornerRadius = UDim.new(1, 0)
     statusDotCorner.Parent = statusDot
 
-    -- Status Label
+    -- Label de status
     local statusLabel = Instance.new("TextLabel")
     statusLabel.Size = UDim2.new(1, -50, 0, 20)
     statusLabel.Position = UDim2.new(0, 30, 0, 335)
@@ -213,9 +213,11 @@ end
 
 -- Função para criar sliders
 local function createSlider(parent, label, minVal, maxVal, defaultVal, callback)
+    local index = #parent:GetChildren()
+    local yOffset = index * 60 + 10
     local frame = Instance.new("Frame")
     frame.Size = UDim2.new(1, -20, 0, 50)
-    frame.Position = UDim2.new(0, 10, 0, #parent:GetChildren() * 60 + 10)
+    frame.Position = UDim2.new(0, 10, 0, yOffset)
     frame.BackgroundTransparency = 1
     frame.Parent = parent
 
@@ -276,8 +278,8 @@ local function createSlider(parent, label, minVal, maxVal, defaultVal, callback)
         percent = math.clamp(percent, 0, 1)
         local value = math.floor(minVal + percent * (maxVal - minVal) + 0.5)
         numberLabel.Text = tostring(value)
-        local trackWidth = track.AbsoluteSize.X
-        local thumbX = percent * trackWidth
+        local trackSize = track.AbsoluteSize.X
+        local thumbX = percent * trackSize
         thumb.Position = UDim2.new(0, thumbX, 0.5, 0)
         fill.Size = UDim2.new(0, thumbX, 1, 0)
         callback(value)
@@ -432,6 +434,7 @@ end
 -- Inicialização
 local function setup()
     createUI()
+
     -- Criar sliders
     createSlider(uiElements.SliderContainer, "Fly Speed", CONFIG.SPEED_MIN, CONFIG.SPEED_MAX, values.flySpeed, function(v)
         values.flySpeed = v
@@ -447,14 +450,14 @@ local function setup()
 
     setupPanelDrag()
 
-    -- Conexões
+    -- Conexões dos botões
     uiElements.ToggleFlyBtn.Activated:Connect(toggleFly)
     uiElements.MinimizeBtn.Activated:Connect(function()
         flyState.minimized = not flyState.minimized
         local tweenInfo = TweenInfo.new(0.4, Enum.EasingStyle.Quart, Enum.EasingDirection.InOut)
         if flyState.minimized then
-            local currentPos = uiElements.Panel.Size
-            flyState.lastMinimizedSize = currentPos
+            -- Minimizar
+            flyState.lastMinimizedSize = uiElements.Panel.Size
             TweenService:Create(uiElements.Panel, tweenInfo, {
                 Size = UDim2.new(0, 55, 0, 55),
                 Position = uiElements.Panel.Position
@@ -465,6 +468,7 @@ local function setup()
             end
             uiElements.MinimizeBtn.Text = "+"
         else
+            -- Restaurar
             TweenService:Create(uiElements.Panel, tweenInfo, {
                 Size = flyState.lastMinimizedSize or UDim2.new(0, 300, 0, 380),
                 Position = flyState.lastMinimizedPos or UDim2.new(0, 20, 0.5, -190)
