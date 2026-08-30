@@ -43,7 +43,7 @@ local flyState = {
 	dragStart = nil,
 	panelStart = nil,
 	minimized = false,
-	lastMinimizedPos = UDim2.new(0, 20, 0.5, -25) -- Posição da bolinha
+	lastMinimizedPos = UDim2.new(0, 20, 0.5, -25)
 }
 
 local values = {
@@ -413,7 +413,6 @@ local function createSlider(container, yPosition, labelText, minValue, maxValue,
 	thumbCorner.CornerRadius = UDim.new(1, 0)
 	thumbCorner.Parent = thumb
 
-	-- Sombra do thumb
 	local thumbShadow = Instance.new("UIStroke")
 	thumbShadow.Color = Color3.fromRGB(100, 150, 255)
 	thumbShadow.Thickness = 2
@@ -626,6 +625,12 @@ local function setupInputHandling()
 		dragArea.InputBegan:Connect(function(input)
 			if input.UserInputType == Enum.UserInputType.MouseButton1 or 
 			   input.UserInputType == Enum.UserInputType.Touch then
+				-- Se estiver minimizado e clicou na bolinha, expande
+				if flyState.minimized and dragArea == uiElements.panel then
+					toggleMinimize()
+					return
+				end
+
 				flyState.draggingPanel = true
 				flyState.dragStart = input.Position
 				flyState.panelStart = uiElements.panel.Position
@@ -648,7 +653,6 @@ local function setupInputHandling()
 				flyState.panelStart.Y.Offset + delta.Y
 			)
 
-			-- Atualizar posição última se minimizado
 			if flyState.minimized then
 				flyState.lastMinimizedPos = uiElements.panel.Position
 			end
