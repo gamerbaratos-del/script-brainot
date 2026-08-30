@@ -1,35 +1,23 @@
--- ============================================
--- ROBLOX FLY SCRIPT - PROFISSIONAL
--- ============================================
-
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 
--- ============================================
--- CONFIGURAÇÕES
--- ============================================
-
 local CONFIG = {
 	FLY_SPEED = 60,
 	SPRINT_MULT = 2.5,
 	TOGGLE_KEY = Enum.KeyCode.F,
-	
+
 	SPEED_MIN = 1,
 	SPEED_MAX = 1000,
 	JUMP_MIN = 0,
 	JUMP_MAX = 3000,
 	WALK_MIN = 0,
 	WALK_MAX = 3000,
-	
+
 	JUMP_POWER = 50,
 	WALK_SPEED = 16
 }
-
--- ============================================
--- VARIÁVEIS GLOBAIS
--- ============================================
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
@@ -43,7 +31,7 @@ local flyState = {
 	dragStart = nil,
 	panelStart = nil,
 	minimized = false,
-	lastMinimizedPos = UDim2.new(0, 20, 0.5, -25)
+	lastMinimizedPos = UDim2.new(0, 20, 0.5, -185)
 }
 
 local values = {
@@ -53,10 +41,6 @@ local values = {
 }
 
 local uiElements = {}
-
--- ============================================
--- FUNÇÕES UTILITÁRIAS
--- ============================================
 
 local function getHumanoid()
 	local character = player.Character
@@ -70,6 +54,7 @@ end
 
 local function applyCharacterValues()
 	local humanoid = getHumanoid()
+
 	if humanoid then
 		humanoid.UseJumpPower = true
 		humanoid.JumpPower = values.jumpPower
@@ -81,102 +66,91 @@ local function getInputDirection()
 	local direction = Vector3.zero
 
 	if UserInputService:IsKeyDown(Enum.KeyCode.W) or UserInputService:IsKeyDown(Enum.KeyCode.Up) then
-		direction = direction + Vector3.new(0, 0, -1)
+		direction += Vector3.new(0, 0, -1)
 	end
 
 	if UserInputService:IsKeyDown(Enum.KeyCode.S) or UserInputService:IsKeyDown(Enum.KeyCode.Down) then
-		direction = direction + Vector3.new(0, 0, 1)
+		direction += Vector3.new(0, 0, 1)
 	end
 
 	if UserInputService:IsKeyDown(Enum.KeyCode.A) or UserInputService:IsKeyDown(Enum.KeyCode.Left) then
-		direction = direction + Vector3.new(-1, 0, 0)
+		direction += Vector3.new(-1, 0, 0)
 	end
 
 	if UserInputService:IsKeyDown(Enum.KeyCode.D) or UserInputService:IsKeyDown(Enum.KeyCode.Right) then
-		direction = direction + Vector3.new(1, 0, 0)
+		direction += Vector3.new(1, 0, 0)
 	end
 
 	if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
-		direction = direction + Vector3.new(0, 1, 0)
+		direction += Vector3.new(0, 1, 0)
 	end
 
-	if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.RightControl) then
-		direction = direction + Vector3.new(0, -1, 0)
+	if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
+		or UserInputService:IsKeyDown(Enum.KeyCode.RightControl) then
+		direction += Vector3.new(0, -1, 0)
 	end
 
 	return direction
 end
 
--- ============================================
--- MINIMIZAR/EXPANDIR COM ANIMAÇÃO SUAVE
--- ============================================
-
 local function toggleMinimize()
-	flyState.minimized = not flyState.minimized
-	
-	local tweenInfo = TweenInfo.new(0.4, Enum.EasingStyle.Quart, Enum.EasingDirection.InOut)
-	
 	if flyState.minimized then
-		-- Minimizar para bolinha - mantém posição atual
-		local currentPos = uiElements.panel.Position
-		flyState.lastMinimizedPos = currentPos
-		
-		TweenService:Create(uiElements.panel, tweenInfo, {
-			Size = UDim2.new(0, 55, 0, 55),
-			Position = UDim2.new(currentPos.X.Scale, currentPos.X.Offset, currentPos.Y.Scale, currentPos.Y.Offset)
+		flyState.minimized = false
+
+		local position = flyState.lastMinimizedPos
+
+		TweenService:Create(uiElements.panel, TweenInfo.new(
+			0.4,
+			Enum.EasingStyle.Quart,
+			Enum.EasingDirection.InOut
+		), {
+			Size = UDim2.new(0, 280, 0, 370),
+			Position = position
 		}):Play()
-		
-		task.wait(0.1)
-		
-		-- Esconder elementos
+
+		task.delay(0.2, function()
+			uiElements.titleBar.Visible = true
+			uiElements.toggleButton.Visible = true
+			uiElements.statusDot.Visible = true
+			uiElements.statusLabel.Visible = true
+			uiElements.sliderContainer.Visible = true
+
+			uiElements.minimizeButton.Text = "−"
+			uiElements.minimizeButton.Size = UDim2.new(0, 30, 0, 30)
+			uiElements.minimizeButton.Position = UDim2.new(1, -40, 0, 6)
+			uiElements.minimizeButton.BackgroundColor3 = Color3.fromRGB(240, 100, 100)
+			uiElements.minimizeButton.ZIndex = 10
+		end)
+	else
+		flyState.minimized = true
+		flyState.lastMinimizedPos = uiElements.panel.Position
+
 		uiElements.titleBar.Visible = false
 		uiElements.toggleButton.Visible = false
 		uiElements.statusDot.Visible = false
 		uiElements.statusLabel.Visible = false
 		uiElements.sliderContainer.Visible = false
-		
-		-- Mostrar botão de expandir (transformar em +)
+
 		uiElements.minimizeButton.Text = "+"
-		uiElements.minimizeButton.Visible = true
 		uiElements.minimizeButton.Size = UDim2.new(1, 0, 1, 0)
 		uiElements.minimizeButton.Position = UDim2.new(0, 0, 0, 0)
 		uiElements.minimizeButton.BackgroundColor3 = Color3.fromRGB(100, 150, 255)
-		uiElements.minimizeButton.ZIndex = 5
-		
-	else
-		-- Expandir para painel normal - volta para posição salva
-		local currentPos = flyState.lastMinimizedPos
-		
-		TweenService:Create(uiElements.panel, tweenInfo, {
-			Size = UDim2.new(0, 280, 0, 370),
-			Position = UDim2.new(currentPos.X.Scale, currentPos.X.Offset, currentPos.Y.Scale, currentPos.Y.Offset)
-		}):Play()
-		
-		task.wait(0.2)
-		
-		-- Mostrar elementos
-		uiElements.titleBar.Visible = true
-		uiElements.toggleButton.Visible = true
-		uiElements.statusDot.Visible = true
-		uiElements.statusLabel.Visible = true
-		uiElements.sliderContainer.Visible = true
-		
-		-- Restaurar botão minimizar
-		uiElements.minimizeButton.Text = "−"
+		uiElements.minimizeButton.ZIndex = 20
 		uiElements.minimizeButton.Visible = true
-		uiElements.minimizeButton.Size = UDim2.new(0, 30, 0, 30)
-		uiElements.minimizeButton.Position = UDim2.new(1, -40, 0, 6)
-		uiElements.minimizeButton.BackgroundColor3 = Color3.fromRGB(240, 100, 100)
-		uiElements.minimizeButton.ZIndex = 10
+
+		TweenService:Create(uiElements.panel, TweenInfo.new(
+			0.4,
+			Enum.EasingStyle.Quart,
+			Enum.EasingDirection.InOut
+		), {
+			Size = UDim2.new(0, 55, 0, 55)
+		}):Play()
 	end
 end
 
--- ============================================
--- CRIAR UI
--- ============================================
-
 local function createUI()
 	local oldGui = playerGui:FindFirstChild("FlyControlUI")
+
 	if oldGui then
 		oldGui:Destroy()
 	end
@@ -200,12 +174,11 @@ local function createUI()
 	panelCorner.CornerRadius = UDim.new(0, 16)
 	panelCorner.Parent = panel
 
-	-- Shadow/Glow effect
-	local panelShadow = Instance.new("UIStroke")
-	panelShadow.Color = Color3.fromRGB(100, 150, 255)
-	panelShadow.Thickness = 1
-	panelShadow.Transparency = 0.7
-	panelShadow.Parent = panel
+	local panelStroke = Instance.new("UIStroke")
+	panelStroke.Color = Color3.fromRGB(100, 150, 255)
+	panelStroke.Thickness = 1
+	panelStroke.Transparency = 0.7
+	panelStroke.Parent = panel
 
 	local titleBar = Instance.new("Frame")
 	titleBar.Size = UDim2.new(1, 0, 0, 45)
@@ -235,11 +208,10 @@ local function createUI()
 	titleText.TextXAlignment = Enum.TextXAlignment.Left
 	titleText.Parent = titleBar
 
-	-- Botão Minimizar
 	local minimizeButton = Instance.new("TextButton")
 	minimizeButton.Name = "MinimizeBtn"
 	minimizeButton.Size = UDim2.new(0, 30, 0, 30)
-	minimizeButton.Position = UDim2.new(1, -40, 0, 7.5)
+	minimizeButton.Position = UDim2.new(1, -40, 0, 6)
 	minimizeButton.BackgroundColor3 = Color3.fromRGB(240, 100, 100)
 	minimizeButton.BorderSizePixel = 0
 	minimizeButton.AutoButtonColor = false
@@ -247,38 +219,15 @@ local function createUI()
 	minimizeButton.Font = Enum.Font.GothamBold
 	minimizeButton.TextSize = 18
 	minimizeButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-	minimizeButton.ZIndex = 10
-	minimizeButton.Parent = titleBar
+	minimizeButton.ZIndex = 20
+
+	-- O botão fica no painel para continuar clicável quando minimizado.
+	minimizeButton.Parent = panel
 
 	local minimizeCorner = Instance.new("UICorner")
 	minimizeCorner.CornerRadius = UDim.new(0, 8)
 	minimizeCorner.Parent = minimizeButton
 
-	minimizeButton.MouseEnter:Connect(function()
-		if not flyState.minimized then
-			TweenService:Create(minimizeButton, TweenInfo.new(0.2), {
-				BackgroundColor3 = Color3.fromRGB(255, 120, 120)
-			}):Play()
-		else
-			TweenService:Create(minimizeButton, TweenInfo.new(0.2), {
-				BackgroundColor3 = Color3.fromRGB(120, 170, 255)
-			}):Play()
-		end
-	end)
-
-	minimizeButton.MouseLeave:Connect(function()
-		if not flyState.minimized then
-			TweenService:Create(minimizeButton, TweenInfo.new(0.2), {
-				BackgroundColor3 = Color3.fromRGB(240, 100, 100)
-			}):Play()
-		else
-			TweenService:Create(minimizeButton, TweenInfo.new(0.2), {
-				BackgroundColor3 = Color3.fromRGB(100, 150, 255)
-			}):Play()
-		end
-	end)
-
-	-- Botão Toggle Fly
 	local toggleButton = Instance.new("TextButton")
 	toggleButton.Name = "ToggleFly"
 	toggleButton.Size = UDim2.new(1, -30, 0, 45)
@@ -292,25 +241,10 @@ local function createUI()
 	toggleButton.TextColor3 = Color3.fromRGB(180, 200, 255)
 	toggleButton.Parent = panel
 
-	local buttonCorner = Instance.new("UICorner")
-	buttonCorner.CornerRadius = UDim.new(0, 12)
-	buttonCorner.Parent = toggleButton
+	local toggleCorner = Instance.new("UICorner")
+	toggleCorner.CornerRadius = UDim.new(0, 12)
+	toggleCorner.Parent = toggleButton
 
-	toggleButton.MouseEnter:Connect(function()
-		TweenService:Create(toggleButton, TweenInfo.new(0.2), {
-			BackgroundColor3 = Color3.fromRGB(80, 100, 150)
-		}):Play()
-	end)
-
-	toggleButton.MouseLeave:Connect(function()
-		if not flyState.flying then
-			TweenService:Create(toggleButton, TweenInfo.new(0.2), {
-				BackgroundColor3 = Color3.fromRGB(70, 80, 120)
-			}):Play()
-		end
-	end)
-
-	-- Container para sliders
 	local sliderContainer = Instance.new("Frame")
 	sliderContainer.Name = "SliderContainer"
 	sliderContainer.Size = UDim2.new(1, 0, 1, -115)
@@ -318,7 +252,6 @@ local function createUI()
 	sliderContainer.BackgroundTransparency = 1
 	sliderContainer.Parent = panel
 
-	-- Status Indicator
 	local statusDot = Instance.new("Frame")
 	statusDot.Size = UDim2.new(0, 10, 0, 10)
 	statusDot.Position = UDim2.new(0, 15, 0, 348)
@@ -353,10 +286,6 @@ local function createUI()
 	}
 end
 
--- ============================================
--- CRIAR SLIDERS
--- ============================================
-
 local function createSlider(container, yPosition, labelText, minValue, maxValue, defaultValue, callback)
 	local header = Instance.new("Frame")
 	header.Size = UDim2.new(1, -30, 0, 24)
@@ -364,15 +293,15 @@ local function createSlider(container, yPosition, labelText, minValue, maxValue,
 	header.BackgroundTransparency = 1
 	header.Parent = container
 
-	local valueLabel = Instance.new("TextLabel")
-	valueLabel.Size = UDim2.new(0.6, 0, 1, 0)
-	valueLabel.BackgroundTransparency = 1
-	valueLabel.Text = labelText
-	valueLabel.Font = Enum.Font.GothamSemibold
-	valueLabel.TextSize = 12
-	valueLabel.TextColor3 = Color3.fromRGB(150, 150, 200)
-	valueLabel.TextXAlignment = Enum.TextXAlignment.Left
-	valueLabel.Parent = header
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(0.6, 0, 1, 0)
+	label.BackgroundTransparency = 1
+	label.Text = labelText
+	label.Font = Enum.Font.GothamSemibold
+	label.TextSize = 12
+	label.TextColor3 = Color3.fromRGB(150, 150, 200)
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.Parent = header
 
 	local numberLabel = Instance.new("TextLabel")
 	numberLabel.Size = UDim2.new(0.4, 0, 1, 0)
@@ -399,7 +328,6 @@ local function createSlider(container, yPosition, labelText, minValue, maxValue,
 	trackCorner.Parent = track
 
 	local fill = Instance.new("Frame")
-	fill.Size = UDim2.new(0, 0, 1, 0)
 	fill.BackgroundColor3 = Color3.fromRGB(100, 200, 255)
 	fill.BorderSizePixel = 0
 	fill.Parent = track
@@ -411,7 +339,6 @@ local function createSlider(container, yPosition, labelText, minValue, maxValue,
 	local thumb = Instance.new("TextButton")
 	thumb.Size = UDim2.new(0, 18, 0, 18)
 	thumb.AnchorPoint = Vector2.new(0.5, 0.5)
-	thumb.Position = UDim2.new(0, 0, 0.5, 0)
 	thumb.Text = ""
 	thumb.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
 	thumb.BorderSizePixel = 0
@@ -423,80 +350,57 @@ local function createSlider(container, yPosition, labelText, minValue, maxValue,
 	thumbCorner.CornerRadius = UDim.new(1, 0)
 	thumbCorner.Parent = thumb
 
-	local thumbShadow = Instance.new("UIStroke")
-	thumbShadow.Color = Color3.fromRGB(100, 150, 255)
-	thumbShadow.Thickness = 2
-	thumbShadow.Transparency = 0.5
-	thumbShadow.Parent = thumb
-
-	local function setValueFromPercent(percent)
+	local function setValue(percent)
 		percent = math.clamp(percent, 0, 1)
+
 		local value = math.floor(minValue + percent * (maxValue - minValue) + 0.5)
+		local width = track.AbsoluteSize.X
+
 		numberLabel.Text = tostring(value)
 
-		local trackWidth = track.AbsoluteSize.X
-		if trackWidth > 0 then
-			local thumbX = percent * trackWidth
-			thumb.Position = UDim2.new(0, thumbX, 0.5, 0)
-			fill.Size = UDim2.new(0, thumbX, 1, 0)
+		if width > 0 then
+			local x = percent * width
+			thumb.Position = UDim2.new(0, x, 0.5, 0)
+			fill.Size = UDim2.new(0, x, 1, 0)
 		end
 
 		callback(value)
 	end
 
-	local function updateFromInput(input)
-		local trackWidth = track.AbsoluteSize.X
-		if trackWidth <= 0 then return end
+	local function update(input)
+		local width = track.AbsoluteSize.X
 
-		local percent = (input.Position.X - track.AbsolutePosition.X) / trackWidth
-		setValueFromPercent(percent)
+		if width > 0 then
+			setValue((input.Position.X - track.AbsolutePosition.X) / width)
+		end
 	end
 
 	local function beginDrag(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or 
-		   input.UserInputType == Enum.UserInputType.Touch then
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
 			flyState.sliderDragging = track
-			updateFromInput(input)
+			update(input)
 		end
 	end
 
 	track.InputBegan:Connect(beginDrag)
 	thumb.InputBegan:Connect(beginDrag)
 
-	local percent = (defaultValue - minValue) / (maxValue - minValue)
 	task.defer(function()
-		setValueFromPercent(percent)
+		setValue((defaultValue - minValue) / (maxValue - minValue))
 	end)
 end
 
--- ============================================
--- FLY FUNCTIONS
--- ============================================
-
 local function setUIFlying(state)
-	local tweenInfo = TweenInfo.new(0.25, Enum.EasingStyle.Quad)
-
 	if state then
-		TweenService:Create(uiElements.toggleButton, tweenInfo, {
-			BackgroundColor3 = Color3.fromRGB(100, 200, 100)
-		}):Play()
-
-		TweenService:Create(uiElements.statusDot, tweenInfo, {
-			BackgroundColor3 = Color3.fromRGB(100, 255, 120)
-		}):Play()
-
+		uiElements.toggleButton.BackgroundColor3 = Color3.fromRGB(100, 200, 100)
+		uiElements.statusDot.BackgroundColor3 = Color3.fromRGB(100, 255, 120)
 		uiElements.toggleButton.Text = "■  DESATIVAR FLY  [F]"
 		uiElements.statusLabel.Text = "● FLYING"
 		uiElements.statusLabel.TextColor3 = Color3.fromRGB(100, 255, 120)
 	else
-		TweenService:Create(uiElements.toggleButton, tweenInfo, {
-			BackgroundColor3 = Color3.fromRGB(70, 80, 120)
-		}):Play()
-
-		TweenService:Create(uiElements.statusDot, tweenInfo, {
-			BackgroundColor3 = Color3.fromRGB(150, 150, 180)
-		}):Play()
-
+		uiElements.toggleButton.BackgroundColor3 = Color3.fromRGB(70, 80, 120)
+		uiElements.statusDot.BackgroundColor3 = Color3.fromRGB(150, 150, 180)
 		uiElements.toggleButton.Text = "▶  ATIVAR FLY  [F]"
 		uiElements.statusLabel.Text = "● IDLE"
 		uiElements.statusLabel.TextColor3 = Color3.fromRGB(150, 150, 180)
@@ -506,11 +410,15 @@ end
 local function enableFly()
 	local root = getRootPart()
 
-	if root:FindFirstChild("FlyVelocity") then
-		root.FlyVelocity:Destroy()
+	local oldVelocity = root:FindFirstChild("FlyVelocity")
+	local oldGyro = root:FindFirstChild("FlyGyro")
+
+	if oldVelocity then
+		oldVelocity:Destroy()
 	end
-	if root:FindFirstChild("FlyGyro") then
-		root.FlyGyro:Destroy()
+
+	if oldGyro then
+		oldGyro:Destroy()
 	end
 
 	flyState.bodyVel = Instance.new("BodyVelocity")
@@ -527,6 +435,7 @@ local function enableFly()
 	flyState.bodyGyro.Parent = root
 
 	local humanoid = getHumanoid()
+
 	if humanoid then
 		humanoid.PlatformStand = true
 	end
@@ -547,6 +456,7 @@ local function disableFly()
 	end
 
 	local humanoid = getHumanoid()
+
 	if humanoid then
 		humanoid.PlatformStand = false
 	end
@@ -563,78 +473,83 @@ local function toggleFly()
 	end
 end
 
--- ============================================
--- INPUT HANDLING
--- ============================================
-
 local function setupInputHandling()
 	UserInputService.InputChanged:Connect(function(input)
-		if not flyState.sliderDragging then return end
+		if not flyState.sliderDragging then
+			return
+		end
 
-		if input.UserInputType == Enum.UserInputType.MouseMovement or 
-		   input.UserInputType == Enum.UserInputType.Touch then
-			local track = flyState.sliderDragging
-			local trackWidth = track.AbsoluteSize.X
+		if input.UserInputType ~= Enum.UserInputType.MouseMovement
+			and input.UserInputType ~= Enum.UserInputType.Touch then
+			return
+		end
 
-			if trackWidth > 0 then
-				local percent = (input.Position.X - track.AbsolutePosition.X) / trackWidth
-				percent = math.clamp(percent, 0, 1)
+		local track = flyState.sliderDragging
+		local width = track.AbsoluteSize.X
 
-				local minValue, maxValue
-				local callbackFn
+		if width <= 0 then
+			return
+		end
 
-				if track.Name == "Fly SpeedSlider" then
-					minValue, maxValue = CONFIG.SPEED_MIN, CONFIG.SPEED_MAX
-					callbackFn = function(v) values.flySpeed = v end
-				elseif track.Name == "JumpPowerSlider" then
-					minValue, maxValue = CONFIG.JUMP_MIN, CONFIG.JUMP_MAX
-					callbackFn = function(v) values.jumpPower = v; applyCharacterValues() end
-				else
-					minValue, maxValue = CONFIG.WALK_MIN, CONFIG.WALK_MAX
-					callbackFn = function(v) values.walkSpeed = v; applyCharacterValues() end
-				end
+		local percent = math.clamp(
+			(input.Position.X - track.AbsolutePosition.X) / width,
+			0,
+			1
+		)
 
-				local value = math.floor(minValue + percent * (maxValue - minValue) + 0.5)
-				callbackFn(value)
+		local minValue
+		local maxValue
+		local callback
 
-				local thumb = track:FindFirstChildOfClass("TextButton")
-				local fill = track:FindFirstChildOfClass("Frame")
-
-				if thumb then
-					thumb.Position = UDim2.new(0, percent * trackWidth, 0.5, 0)
-				end
-
-				if fill then
-					fill.Size = UDim2.new(percent, 0, 1, 0)
-				end
-
-				local parent = track.Parent
-				for _, child in ipairs(parent:GetChildren()) do
-					if child:IsA("Frame") and child.Name ~= track.Name then
-						for _, label in ipairs(child:GetChildren()) do
-							if label:IsA("TextLabel") and label.TextColor3 == Color3.fromRGB(100, 200, 255) then
-								label.Text = tostring(value)
-								break
-							end
-						end
-					end
-				end
+		if track.Name == "Fly SpeedSlider" then
+			minValue = CONFIG.SPEED_MIN
+			maxValue = CONFIG.SPEED_MAX
+			callback = function(value)
+				values.flySpeed = value
 			end
+		elseif track.Name == "JumpPowerSlider" then
+			minValue = CONFIG.JUMP_MIN
+			maxValue = CONFIG.JUMP_MAX
+			callback = function(value)
+				values.jumpPower = value
+				applyCharacterValues()
+			end
+		else
+			minValue = CONFIG.WALK_MIN
+			maxValue = CONFIG.WALK_MAX
+			callback = function(value)
+				values.walkSpeed = value
+				applyCharacterValues()
+			end
+		end
+
+		local value = math.floor(minValue + percent * (maxValue - minValue) + 0.5)
+		callback(value)
+
+		local thumb = track:FindFirstChildOfClass("TextButton")
+		local fill = track:FindFirstChildOfClass("Frame")
+
+		if thumb then
+			thumb.Position = UDim2.new(0, percent * width, 0.5, 0)
+		end
+
+		if fill then
+			fill.Size = UDim2.new(percent, 0, 1, 0)
 		end
 	end)
 
 	UserInputService.InputEnded:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or 
-		   input.UserInputType == Enum.UserInputType.Touch then
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
 			flyState.sliderDragging = nil
 			flyState.draggingPanel = false
 		end
 	end)
 
-	local function setupPanelDrag(dragArea)
-		dragArea.InputBegan:Connect(function(input)
-			if input.UserInputType == Enum.UserInputType.MouseButton1 or 
-			   input.UserInputType == Enum.UserInputType.Touch then
+	local function setupPanelDrag(area)
+		area.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
 				flyState.draggingPanel = true
 				flyState.dragStart = input.Position
 				flyState.panelStart = uiElements.panel.Position
@@ -643,28 +558,33 @@ local function setupInputHandling()
 	end
 
 	setupPanelDrag(uiElements.titleBar)
-	setupPanelDrag(uiElements.panel)
-
-	UserInputService.InputChanged:Connect(function(input)
-		if flyState.draggingPanel and (input.UserInputType == Enum.UserInputType.MouseMovement or 
-		   input.UserInputType == Enum.UserInputType.Touch) then
-			local delta = input.Position - flyState.dragStart
-
-			uiElements.panel.Position = UDim2.new(
-				flyState.panelStart.X.Scale,
-				flyState.panelStart.X.Offset + delta.X,
-				flyState.panelStart.Y.Scale,
-				flyState.panelStart.Y.Offset + delta.Y
-			)
-
-			if flyState.minimized then
-				flyState.lastMinimizedPos = uiElements.panel.Position
-			end
-		end
-	end)
 
 	uiElements.toggleButton.Activated:Connect(toggleFly)
 	uiElements.minimizeButton.Activated:Connect(toggleMinimize)
+
+	UserInputService.InputChanged:Connect(function(input)
+		if not flyState.draggingPanel then
+			return
+		end
+
+		if input.UserInputType ~= Enum.UserInputType.MouseMovement
+			and input.UserInputType ~= Enum.UserInputType.Touch then
+			return
+		end
+
+		local delta = input.Position - flyState.dragStart
+
+		uiElements.panel.Position = UDim2.new(
+			flyState.panelStart.X.Scale,
+			flyState.panelStart.X.Offset + delta.X,
+			flyState.panelStart.Y.Scale,
+			flyState.panelStart.Y.Offset + delta.Y
+		)
+
+		if flyState.minimized then
+			flyState.lastMinimizedPos = uiElements.panel.Position
+		end
+	end)
 
 	UserInputService.InputBegan:Connect(function(input, gameProcessed)
 		if not gameProcessed and input.KeyCode == CONFIG.TOGGLE_KEY then
@@ -673,31 +593,41 @@ local function setupInputHandling()
 	end)
 end
 
--- ============================================
--- HEARTBEAT
--- ============================================
-
 local function setupFlightLoop()
 	RunService.Heartbeat:Connect(function()
-		if not flyState.flying or not flyState.bodyVel or not flyState.bodyGyro then
+		if not flyState.flying
+			or not flyState.bodyVel
+			or not flyState.bodyGyro then
 			return
 		end
 
 		local root = getRootPart()
 		local camera = workspace.CurrentCamera
-		local inputDirection = getInputDirection()
 
-		if not camera then return end
+		if not camera then
+			return
+		end
 
-		local sprinting = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or 
-						 UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
-		local speed = sprinting and values.flySpeed * CONFIG.SPRINT_MULT or values.flySpeed
+		local direction = getInputDirection()
+		local sprinting = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
+			or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
 
-		if inputDirection.Magnitude > 0 then
-			local worldDirection = camera.CFrame:VectorToWorldSpace(inputDirection).Unit
+		local speed = values.flySpeed
+
+		if sprinting then
+			speed *= CONFIG.SPRINT_MULT
+		end
+
+		if direction.Magnitude > 0 then
+			local worldDirection = camera.CFrame:VectorToWorldSpace(direction).Unit
 			flyState.bodyVel.Velocity = worldDirection * speed
 
-			local lookDirection = Vector3.new(worldDirection.X, 0, worldDirection.Z)
+			local lookDirection = Vector3.new(
+				worldDirection.X,
+				0,
+				worldDirection.Z
+			)
+
 			if lookDirection.Magnitude > 0.01 then
 				flyState.bodyGyro.CFrame = CFrame.lookAt(
 					root.Position,
@@ -705,14 +635,10 @@ local function setupFlightLoop()
 				)
 			end
 		else
-			flyState.bodyVel.Velocity = flyState.bodyVel.Velocity * 0.85
+			flyState.bodyVel.Velocity *= 0.85
 		end
 	end)
 end
-
--- ============================================
--- CHARACTER RESPAWN
--- ============================================
 
 local function setupCharacterHandling()
 	player.CharacterAdded:Connect(function()
@@ -726,20 +652,47 @@ local function setupCharacterHandling()
 	end)
 end
 
--- ============================================
--- INICIALIZAR
--- ============================================
-
 createUI()
-createSlider(uiElements.sliderContainer, 0, "Fly Speed", CONFIG.SPEED_MIN, CONFIG.SPEED_MAX, CONFIG.FLY_SPEED, 
-	function(value) values.flySpeed = value end)
-createSlider(uiElements.sliderContainer, 65, "JumpPower", CONFIG.JUMP_MIN, CONFIG.JUMP_MAX, CONFIG.JUMP_POWER, 
-	function(value) values.jumpPower = value; applyCharacterValues() end)
-createSlider(uiElements.sliderContainer, 130, "WalkSpeed", CONFIG.WALK_MIN, CONFIG.WALK_MAX, CONFIG.WALK_SPEED, 
-	function(value) values.walkSpeed = value; applyCharacterValues() end)
+
+createSlider(
+	uiElements.sliderContainer,
+	0,
+	"Fly Speed",
+	CONFIG.SPEED_MIN,
+	CONFIG.SPEED_MAX,
+	CONFIG.FLY_SPEED,
+	function(value)
+		values.flySpeed = value
+	end
+)
+
+createSlider(
+	uiElements.sliderContainer,
+	65,
+	"JumpPower",
+	CONFIG.JUMP_MIN,
+	CONFIG.JUMP_MAX,
+	CONFIG.JUMP_POWER,
+	function(value)
+		values.jumpPower = value
+		applyCharacterValues()
+	end
+)
+
+createSlider(
+	uiElements.sliderContainer,
+	130,
+	"WalkSpeed",
+	CONFIG.WALK_MIN,
+	CONFIG.WALK_MAX,
+	CONFIG.WALK_SPEED,
+	function(value)
+		values.walkSpeed = value
+		applyCharacterValues()
+	end
+)
 
 setupInputHandling()
 setupFlightLoop()
 setupCharacterHandling()
-
 applyCharacterValues()
