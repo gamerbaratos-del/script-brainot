@@ -1,3 +1,4 @@
+-- FlyControlUI with automatic noclip while flying
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
@@ -25,6 +26,37 @@ local flying = false
 local bodyVel = nil
 local bodyGyro = nil
 local sliderDragging = nil
+
+-- noclip support
+local NOCLIP_ON_FLY = true
+local originalCollisions = {}
+
+local function enableNoClip()
+	local char = player.Character
+	if not char then return end
+	originalCollisions = {}
+	for _, obj in ipairs(char:GetDescendants()) do
+		if obj:IsA("BasePart") then
+			-- store original CanCollide (pcall in case property is locked)
+			pcall(function()
+				originalCollisions[obj] = obj.CanCollide
+				obj.CanCollide = false
+			end)
+		end
+	end
+end
+
+local function disableNoClip()
+	-- restore stored CanCollide values
+	for part, val in pairs(originalCollisions) do
+		if part and part:IsA("BasePart") and part.Parent then
+			pcall(function()
+				part.CanCollide = val
+			end)
+		end
+	end
+	originalCollisions = {}
+end
 
 local oldGui = playerGui:FindFirstChild("FlyControlUI")
 if oldGui then
@@ -301,15 +333,6 @@ UserInputService.InputChanged:Connect(function(input)
 				walkSpeedValue = value
 			end
 
-			for _, object in ipairs(track.Parent:GetChildren()) do
-				if object:IsA("TextLabel") then
-					local header = track.Parent:FindFirstChild("Frame")
-					if header then
-						break
-					end
-				end
-			end
-
 			local percentValue = (value - minValue) / (maxValue - minValue)
 			local thumb = track:FindFirstChildOfClass("TextButton")
 			local fill = track:FindFirstChildOfClass("Frame")
@@ -445,11 +468,21 @@ local function enableFly()
 		humanoid.PlatformStand = true
 	end
 
+	-- enable noclip when flying if configured
+	if NOCLIP_ON_FLY then
+		enableNoClip()
+	end
+
 	flying = true
 	setUIFlying(true)
 end
 
 local function disableFly()
+	-- restore collisions first
+	if NOCLIP_ON_FLY then
+		disableNoClip()
+	end
+
 	if bodyVel then
 		bodyVel:Destroy()
 		bodyVel = nil
@@ -555,9 +588,15 @@ RunService.Heartbeat:Connect(function()
 end)
 
 player.CharacterAdded:Connect(function()
+	-- reset state on respawn
 	flying = false
 	bodyVel = nil
 	bodyGyro = nil
+
+	-- ensure collisions restored
+	if NOCLIP_ON_FLY then
+		disableNoClip()
+	end
 
 	task.wait(0.5)
 	applyCharacterValues()
