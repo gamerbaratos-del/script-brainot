@@ -1,1156 +1,379 @@
--- FlyControl.lua
--- LocalScript (colocar em StarterPlayerScripts ou StarterCharacterScripts conforme preferir)
--- Versão: completa com UI responsiva, minimizar->bubble com snap, scroll arrows, presets, keybinds, tooltips, e "atravessar" via PhysicsService.
--- OBS: Presets são salvos nas Attributes do Player (persistem na sessão). Para persistência entre sessões, adicione um RemoteEvent + DataStore no servidor.
+-- DevMenu_AllInOne.lua
+-- COLE ESTE SCRIPT EM ServerScriptService (Script)
+-- Ele cria remotes, handlers server-side e injeta um LocalScript no PlayerGui de cada jogador (UI completa).
+-- USE APENAS EM SEU PRÓPRIO JOGO / AMBIENTE DE TESTE.
 
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+
+-- ====== CONFIGURE AQUI: lista de admins (substitua pelos seus UserIds) ======
+local ADMINS = {
+	[12345678] = true, -- <<--- coloque seu UserId aqui
+	--[87654321] = true,
+}
+-- ==========================================================================
+
+-- Ensure remotes exist
+local function ensureRemote(name, class)
+	local obj = ReplicatedStorage:FindFirstChild(name)
+	if obj and obj:IsA(class) then return obj end
+	local newObj = Instance.new(class)
+	newObj.Name = name
+	newObj.Parent = ReplicatedStorage
+	return newObj
+end
+
+local DevEvent = ensureRemote("DevMenuEvent", "RemoteEvent")
+local PresetEvent = ensureRemote("PresetEvent", "RemoteEvent")
+local PingFunction = ensureRemote("PingFunction", "RemoteFunction")
+local WeaponEvent = ensureRemote("WeaponFireEvent", "RemoteEvent")
+
+-- Server: handle dev actions (only admins)
+DevEvent.OnServerEvent:Connect(function(player, action, value)
+	if not player or not action then return end
+	if not ADMINS[player.UserId] then
+		warn(("[DevMenu] %s tentou usar %s sem permissão"):format(player.Name, tostring(action)))
+		return
+	end
+	local attrName = "Dev_" .. tostring(action)
+	local ok, err = pcall(function() player:SetAttribute(attrName, value) end)
+	if not ok then warn("Falha ao setar attribute:", err) end
+	print(("[DevMenu] %s aplicou %s = %s"):format(player.Name, attrName, tostring(value)))
+end)
+
+-- Ping function: server responds with server tick
+if PingFunction and typeof(PingFunction) == "RemoteFunction" then
+	PingFunction.OnServerInvoke = function(player, clientTick)
+		return tick()
+	end
+end
+
+-- Example server-side Weapon handling (authoritative): read Dev_* attributes safely
+do
+	local WEAPONS = {
+		["Pistol"] = {FireRate = 8, Damage = 20, Recoil = 1.0, Spread = 1.0},
+		["Rifle"]  = {FireRate = 6, Damage = 18, Recoil = 1.6, Spread = 2.2},
+	}
+	local lastFire = {}
+	local function canFireKey(player, weaponKey, rate)
+		local key = tostring(player.UserId) .. ":" .. tostring(weaponKey)
+		local now = tick()
+		local last = lastFire[key] or 0
+		if now - last < (1 / rate) then return false end
+		lastFire[key] = now
+		return true
+	end
+
+	WeaponEvent.OnServerEvent:Connect(function(player, weaponKey, clientAim)
+		if not player or not weaponKey then return end
+		local def = WEAPONS[weaponKey]
+		if not def then return end
+
+		-- Read attributes set by admins via DevEvent
+		local noRecoil = player:GetAttribute("Dev_NoRecoil") or false
+		local rapidFire = player:GetAttribute("Dev_RapidFire") or false
+		local noSpread = player:GetAttribute("Dev_NoSpread") or false
+		local fireRateOverride = player:GetAttribute("Dev_FireRate") or def.FireRate
+
+		local effFireRate = fireRateOverride * (rapidFire and 2 or 1)
+		local effRecoil = (noRecoil and 0) or def.Recoil
+		local effSpread = (noSpread and 0) or def.Spread
+
+		if not canFireKey(player, weaponKey, effFireRate) then return end
+
+		-- Example: server-side authoritative log (replace with your raycast & damage)
+		print(("[Weapon] %s disparou %s | rate=%.2f recoil=%.2f spread=%.2f"):format(
+			player.Name, weaponKey, effFireRate, effRecoil, effSpread
+		))
+
+		-- TODO: sua lógica de raycast/causar dano server-side vai aqui (validate clientAim!)
+	end)
+end
+
+-- Client code (will be injected into each player's PlayerGui as a LocalScript)
+local clientSource = [[
+-- DevMenu injected LocalScript (client-side UI)
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
-local PhysicsService = game:GetService("PhysicsService")
-local HttpService = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local player = Players.LocalPlayer
+local DevEvent = ReplicatedStorage:WaitForChild("DevMenuEvent")
+local PingFunction = ReplicatedStorage:WaitForChild("PingFunction")
+local WeaponEvent = ReplicatedStorage:WaitForChild("WeaponFireEvent")
+
+local function safeFire(action, value)
+	pcall(function() DevEvent:FireServer(action, value) end)
+end
+
+local function measurePing()
+	if not PingFunction or typeof(PingFunction) ~= "RemoteFunction" then return nil end
+	local t = tick()
+	local ok, serverTick = pcall(function() return PingFunction:InvokeServer(t) end)
+	if not ok or type(serverTick) ~= "number" then return nil end
+	return math.floor((tick() - t) * 1000)
+end
+
+-- create UI
 local playerGui = player:WaitForChild("PlayerGui")
-local camera = workspace.CurrentCamera
+local old = playerGui:FindFirstChild("DevMenuUI")
+if old then old:Destroy() end
 
--- =========================
--- Configurações padrão
--- =========================
-local DEFAULTS = {
-	FlySpeed = 60,
-	SprintMult = 2.5,
-	JumpPower = 50,
-	WalkSpeed = 16,
-	ToggleKey = Enum.KeyCode.F,
-	InputMode = "Toggle" -- "Toggle" or "Hold"
-}
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "DevMenuUI"
+screenGui.Parent = playerGui
+screenGui.ResetOnSpawn = false
 
-local LIMITS = {
-	Speed = {min = 1, max = 1000},
-	Jump = {min = 0, max = 3000},
-	Walk = {min = 0, max = 3000}
-}
+local panel = Instance.new("Frame", screenGui)
+panel.Name = "Panel"
+panel.Size = UDim2.new(0, 420, 0, 520)
+panel.Position = UDim2.new(0.5, -210, 0.5, -260)
+panel.AnchorPoint = Vector2.new(0.5, 0.5)
+panel.BackgroundColor3 = Color3.fromRGB(18,18,22)
+panel.BorderSizePixel = 0
+local panelCorner = Instance.new("UICorner", panel); panelCorner.CornerRadius = UDim.new(0,14)
 
--- =========================
--- Util (helpers)
--- =========================
-local Utils = {}
-function Utils.clamp(v, a, b) return math.clamp(v, a, b) end
+-- Titlebar: text + FPS + Ping + minimize
+local titleBar = Instance.new("Frame", panel)
+titleBar.Size = UDim2.new(1,0,0,56)
+titleBar.BackgroundColor3 = Color3.fromRGB(24,24,28)
+local title = Instance.new("TextLabel", titleBar)
+title.Size = UDim2.new(1,-160,1,0); title.Position = UDim2.new(0,16,0,0)
+title.BackgroundTransparency = 1; title.Text = "Aether Dev Hub"; title.Font = Enum.Font.GothamBold; title.TextSize = 18; title.TextColor3 = Color3.fromRGB(235,235,240); title.TextScaled = true; title.TextXAlignment = Enum.TextXAlignment.Left
 
--- Tween helper
-function Utils.tween(instance, props, time, style, dir)
-	time = time or 0.18
-	style = style or Enum.EasingStyle.Quad
-	dir = dir or Enum.EasingDirection.Out
-	local info = TweenInfo.new(time, style, dir)
-	local t = TweenService:Create(instance, info, props)
-	t:Play()
-	return t
+local fpsBadge = Instance.new("TextLabel", titleBar)
+fpsBadge.Size = UDim2.new(0,96,0,28); fpsBadge.Position = UDim2.new(1,-112,0.5,-14)
+fpsBadge.BackgroundColor3 = Color3.fromRGB(34,139,34); fpsBadge.Text = "FPS: --"; fpsBadge.Font = Enum.Font.GothamBold; fpsBadge.TextScaled = true; fpsBadge.TextColor3 = Color3.new(1,1,1)
+local pingBadge = Instance.new("TextLabel", titleBar)
+pingBadge.Size = UDim2.new(0,72,0,28); pingBadge.Position = UDim2.new(1,-210,0.5,-14)
+pingBadge.BackgroundColor3 = Color3.fromRGB(200,120,10); pingBadge.Text = "Ping: --"; pingBadge.Font = Enum.Font.GothamBold; pingBadge.TextScaled = true; pingBadge.TextColor3 = Color3.new(1,1,1)
+local ver = Instance.new("TextLabel", titleBar)
+ver.Size = UDim2.new(0,40,0,28); ver.Position = UDim2.new(1,-60,0.5,-14)
+ver.BackgroundColor3 = Color3.fromRGB(80,120,200); ver.Text = "v1.0"; ver.Font = Enum.Font.GothamBold; ver.TextScaled = true; ver.TextColor3 = Color3.new(1,1,1)
+
+-- Minimize button
+local minBtn = Instance.new("TextButton", titleBar)
+minBtn.Size = UDim2.new(0,36,0,36); minBtn.Position = UDim2.new(1,-48,0.5,-18); minBtn.Text = "—"; minBtn.AutoButtonColor = false
+local minCorner = Instance.new("UICorner", minBtn); minCorner.CornerRadius = UDim.new(0,8)
+
+-- left tabs
+local tabs = Instance.new("Frame", panel); tabs.Size = UDim2.new(0,120,1,-56); tabs.Position = UDim2.new(0,0,0,56); tabs.BackgroundTransparency = 1
+local tabsLayout = Instance.new("UIListLayout", tabs); tabsLayout.Padding = UDim.new(0,8)
+local tabsPad = Instance.new("UIPadding", tabs); tabsPad.PaddingTop = UDim.new(0,12); tabsPad.PaddingLeft = UDim.new(0,8)
+
+local function makeTab(name) local b = Instance.new("TextButton", tabs); b.Size = UDim2.new(1,-12,0,40); b.Text = name; b.Font = Enum.Font.GothamSemibold; b.TextSize = 14; b.TextColor3 = Color3.fromRGB(220,220,220); b.AutoButtonColor=false; local c = Instance.new("UICorner", b); c.CornerRadius = UDim.new(0,8); return b end
+local tabUtilities = makeTab("Utilities"); local tabVisuals = makeTab("Visuals"); local tabGunMods = makeTab("Gun Mods"); local tabSettings = makeTab("Settings")
+
+-- content scroll area
+local content = Instance.new("Frame", panel); content.Size = UDim2.new(1,-120,1,-56); content.Position = UDim2.new(0,120,0,56); content.BackgroundTransparency = 1
+local scroll = Instance.new("ScrollingFrame", content); scroll.Size = UDim2.new(1,-24,1,-24); scroll.Position = UDim2.new(0,12,0,12); scroll.BackgroundTransparency = 1; scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y; scroll.ScrollBarThickness = 8
+local layout = Instance.new("UIListLayout", scroll); layout.Padding = UDim.new(0,10)
+local pad = Instance.new("UIPadding", scroll); pad.PaddingTop = UDim.new(0,4); pad.PaddingLeft = UDim.new(0,6); pad.PaddingRight = UDim.new(0,6)
+
+-- helper widgets
+local function addLabel(text)
+	local lbl = Instance.new("TextLabel", scroll); lbl.Size = UDim2.new(1,0,0,22); lbl.BackgroundTransparency = 1; lbl.Text = text; lbl.Font = Enum.Font.GothamSemibold; lbl.TextColor3 = Color3.fromRGB(200,200,210); lbl.TextScaled = true; lbl.TextXAlignment = Enum.TextXAlignment.Left; return lbl
 end
 
-function Utils.copyTable(t)
-	local out = {}
-	for k,v in pairs(t) do out[k]=v end
-	return out
-end
-
--- JSON encode/decode safe
-function Utils.safeEncode(t)
-	local ok, s = pcall(function() return HttpService:JSONEncode(t) end)
-	if ok then return s end
-	return nil
-end
-function Utils.safeDecode(s)
-	local ok, t = pcall(function() return HttpService:JSONDecode(s) end)
-	if ok then return t end
-	return nil
-end
-
--- =========================
--- SettingsManager (atributos de player)
--- Presets armazenados em Attribute "FlyControl_Presets" (JSON: {name->tbl})
--- Config atual em Attribute "FlyControl_Config" (JSON)
--- =========================
-local SettingsManager = {}
-function SettingsManager.loadConfig()
-	local raw = player:GetAttribute("FlyControl_Config")
-	if type(raw) ~= "string" then
-		return Utils.copyTable(DEFAULTS)
+local function addToggle(text, initial, onChanged)
+	local frame = Instance.new("Frame", scroll); frame.Size = UDim2.new(1,0,0,40); frame.BackgroundTransparency = 1
+	local lbl = Instance.new("TextLabel", frame); lbl.Size = UDim2.new(0.65,0,1,0); lbl.BackgroundTransparency = 1; lbl.Text = text; lbl.Font = Enum.Font.GothamSemibold; lbl.TextScaled = true; lbl.TextColor3 = Color3.fromRGB(220,220,220); lbl.TextXAlignment = Enum.TextXAlignment.Left
+	local btn = Instance.new("TextButton", frame); btn.Size = UDim2.new(0,64,0,28); btn.Position = UDim2.new(1,-72,0.5,-14); btn.AutoButtonColor = false; btn.Font = Enum.Font.GothamBold; btn.TextScaled = true
+	local corner = Instance.new("UICorner", btn); corner.CornerRadius = UDim.new(0,8)
+	local state = initial and true or false
+	local function update()
+		btn.Text = state and "ON" or "OFF"
+		btn.BackgroundColor3 = state and Color3.fromRGB(100,200,130) or Color3.fromRGB(72,72,88)
+		if onChanged then pcall(onChanged, state) end
 	end
-	local tbl = Utils.safeDecode(raw)
-	if type(tbl) ~= "table" then
-		return Utils.copyTable(DEFAULTS)
-	end
-	-- ensure defaults
-	for k,v in pairs(DEFAULTS) do
-		if tbl[k] == nil then tbl[k] = v end
-	end
-	return tbl
+	btn.Activated:Connect(function() state = not state; update() end)
+	update()
+	return {frame = frame, set = function(v) state = v; update() end}
 end
 
-function SettingsManager.saveConfig(tbl)
-	if type(tbl) ~= "table" then return end
-	local s = Utils.safeEncode(tbl)
-	if s then
-		player:SetAttribute("FlyControl_Config", s)
-	end
-end
-
-function SettingsManager.getPresets()
-	local raw = player:GetAttribute("FlyControl_Presets")
-	if type(raw) ~= "string" then return {} end
-	local tbl = Utils.safeDecode(raw)
-	if type(tbl) ~= "table" then return {} end
-	return tbl
-end
-
-function SettingsManager.savePresets(presets)
-	local s = Utils.safeEncode(presets)
-	if s then player:SetAttribute("FlyControl_Presets", s) end
-end
-
-function SettingsManager.savePreset(name, tbl)
-	if type(name) ~= "string" or name == "" then return false end
-	local presets = SettingsManager.getPresets()
-	presets[name] = tbl
-	SettingsManager.savePresets(presets)
-	return true
-end
-
-function SettingsManager.deletePreset(name)
-	local presets = SettingsManager.getPresets()
-	presets[name] = nil
-	SettingsManager.savePresets(presets)
-end
-
--- =========================
--- FlyController
--- Encapsula ativar/desativar voo e "atravessar"
--- Usa BodyVelocity/BodyGyro (compatível). Modificar para VectorForce depois é possível.
--- =========================
-local FlyController = {}
-FlyController._flying = false
-FlyController.bodyVel = nil
-FlyController.bodyGyro = nil
-FlyController.modifiedParts = {} -- [part] = original CanCollide
-FlyController.noCollideConn = nil
-FlyController.collisionGroup = "FlyNoCollide"
-
-function FlyController.ensureCollisionGroup()
-	pcall(function()
-		local groups = PhysicsService:GetCollisionGroups()
-		local exists = false
-		for _,g in ipairs(groups) do
-			if g.name == FlyController.collisionGroup then exists = true break end
-		end
-		if not exists then
-			PhysicsService:CreateCollisionGroup(FlyController.collisionGroup)
-		end
-		PhysicsService:CollisionGroupSetCollidable(FlyController.collisionGroup, "Default", false)
-		PhysicsService:CollisionGroupSetCollidable(FlyController.collisionGroup, FlyController.collisionGroup, false)
-	end)
-end
-
-function FlyController.setCharacterNoCollide(character)
-	if not character then return end
-	FlyController.ensureCollisionGroup()
-	FlyController.modifiedParts = {}
-	-- apply to existing parts
-	for _,desc in ipairs(character:GetDescendants()) do
-		if desc:IsA("BasePart") then
-			FlyController.modifiedParts[desc] = desc.CanCollide
-			desc.CanCollide = false
-			pcall(function() PhysicsService:SetPartCollisionGroup(desc, FlyController.collisionGroup) end)
-		end
-	end
-	-- watch for new parts
-	if FlyController.noCollideConn then FlyController.noCollideConn:Disconnect() FlyController.noCollideConn = nil end
-	FlyController.noCollideConn = character.DescendantAdded:Connect(function(desc)
-		if desc and desc:IsA("BasePart") then
-			FlyController.modifiedParts[desc] = desc.CanCollide
-			desc.CanCollide = false
-			pcall(function() PhysicsService:SetPartCollisionGroup(desc, FlyController.collisionGroup) end)
+local function addSlider(labelText, min, max, initial, onChanged)
+	local frame = Instance.new("Frame", scroll); frame.Size = UDim2.new(1,0,0,64); frame.BackgroundTransparency = 1
+	local lbl = Instance.new("TextLabel", frame); lbl.Size = UDim2.new(0.6,0,0,20); lbl.BackgroundTransparency = 1; lbl.Text = labelText; lbl.Font = Enum.Font.GothamSemibold; lbl.TextColor3 = Color3.fromRGB(210,210,210); lbl.TextScaled = true
+	local valLbl = Instance.new("TextLabel", frame); valLbl.Size = UDim2.new(0.4,-6,0,20); valLbl.Position = UDim2.new(0.6,6,0,0); valLbl.Text = tostring(initial); valLbl.Font = Enum.Font.GothamBold; valLbl.TextScaled = true; valLbl.TextXAlignment = Enum.TextXAlignment.Right; valLbl.TextColor3 = Color3.fromRGB(150,170,255)
+	local track = Instance.new("Frame", frame); track.Name = "track"; track.Size = UDim2.new(1,0,0,12); track.Position = UDim2.new(0,0,0,32); track.BackgroundColor3 = Color3.fromRGB(50,50,60)
+	local tc = Instance.new("UICorner", track); tc.CornerRadius = UDim.new(1,0)
+	local fill = Instance.new("Frame", track); fill.Size = UDim2.new((initial-min)/(max-min),0,1,0); fill.BackgroundColor3 = Color3.fromRGB(100,120,255)
+	local fc = Instance.new("UICorner", fill); fc.CornerRadius = UDim.new(1,0)
+	local thumb = Instance.new("TextButton", track); thumb.Size = UDim2.new(0,20,0,20); thumb.AnchorPoint = Vector2.new(0.5,0.5); thumb.Position = UDim2.new((initial-min)/(max-min),0,0.5,0); thumb.Text = ""; thumb.AutoButtonColor = false
+	local thc = Instance.new("UICorner", thumb); thc.CornerRadius = UDim.new(1,0)
+	track.InputBegan:Connect(function(inp)
+		if inp.UserInputType == Enum.UserInputType.MouseButton1 then
+			local conn
+			conn = UserInputService.InputChanged:Connect(function(move)
+				if move.UserInputType == Enum.UserInputType.MouseMovement then
+					local x = math.clamp((move.Position.X - track.AbsolutePosition.X)/track.AbsoluteSize.X,0,1)
+					fill.Size = UDim2.new(x,0,1,0)
+					thumb.Position = UDim2.new(x,0,0.5,0)
+					local val = math.floor(min + x*(max-min) + 0.5)
+					valLbl.Text = tostring(val)
+					if onChanged then pcall(onChanged, val) end
+				end
+			end)
+			local upConn
+			upConn = UserInputService.InputEnded:Connect(function(e)
+				if e.UserInputType == Enum.UserInputType.MouseButton1 then
+					upConn:Disconnect(); conn:Disconnect()
+				end
+			end)
 		end
 	end)
+	return {frame = frame, setValue = function(v) local x=(v-min)/(max-min); fill.Size=UDim2.new(x,0,1,0); thumb.Position=UDim2.new(x,0,0.5,0); valLbl.Text=tostring(v) end}
 end
 
-function FlyController.restoreCharacterCollisions()
-	if FlyController.noCollideConn then FlyController.noCollideConn:Disconnect() FlyController.noCollideConn = nil end
-	for part,orig in pairs(FlyController.modifiedParts) do
-		if part and part.Parent then
-			part.CanCollide = (orig == nil) and true or orig
-			pcall(function() PhysicsService:SetPartCollisionGroup(part, "Default") end)
-		end
-	end
-	FlyController.modifiedParts = {}
-end
+-- Build UI content (similar to image)
+addLabel("Warning: Use these tools only in development/testing environments.")
+local noRecoil = addToggle("No Recoil", false, function(s) safeFire("NoRecoil", s) end)
+local rapidFire = addToggle("Rapid Fire", false, function(s) safeFire("RapidFire", s) end)
+local noSpread = addToggle("No Spread", false, function(s) safeFire("NoSpread", s) end)
+local alwaysAuto = addToggle("Always Auto", false, function(s) safeFire("AlwaysAuto", s) end)
+addLabel("Gun Mods")
+local fireRate = addSlider("Fire Rate", 1, 30, 10, function(v) safeFire("FireRate", v) end)
+local recoilMult = addSlider("Recoil Mult (%)", 0, 200, 100, function(v) safeFire("RecoilMultiplier", v/100) end)
 
-function FlyController.enable(params)
-	-- params: speed, sprintMult
-	local root = (player.Character and player.Character:FindFirstChild("HumanoidRootPart")) or (player.CharacterAdded and player.CharacterAdded:Wait() and player.Character:WaitForChild("HumanoidRootPart"))
-	if not root then return end
-
-	-- clean existing
-	if root:FindFirstChild("FlyVelocity") then root.FlyVelocity:Destroy() end
-	if root:FindFirstChild("FlyGyro") then root.FlyGyro:Destroy() end
-
-	local bodyVel = Instance.new("BodyVelocity")
-	bodyVel.Name = "FlyVelocity"
-	bodyVel.MaxForce = Vector3.new(1e5,1e5,1e5)
-	bodyVel.Velocity = Vector3.new(0,0,0)
-	bodyVel.Parent = root
-	bodyVel.P = 1250
-
-	local bodyGyro = Instance.new("BodyGyro")
-	bodyGyro.Name = "FlyGyro"
-	bodyGyro.MaxTorque = Vector3.new(1e5,1e5,1e5)
-	bodyGyro.D = 50
-	bodyGyro.CFrame = root.CFrame
-	bodyGyro.Parent = root
-
-	FlyController.bodyVel = bodyVel
-	FlyController.bodyGyro = bodyGyro
-
-	local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
-	if humanoid then humanoid.PlatformStand = true end
-
-	-- collisions off
-	local character = player.Character
-	if character then FlyController.setCharacterNoCollide(character) end
-
-	FlyController._flying = true
-end
-
-function FlyController.disable()
-	if FlyController.bodyVel then FlyController.bodyVel:Destroy(); FlyController.bodyVel = nil end
-	if FlyController.bodyGyro then FlyController.bodyGyro:Destroy(); FlyController.bodyGyro = nil end
-
-	local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
-	if humanoid then humanoid.PlatformStand = false end
-
-	FlyController.restoreCharacterCollisions()
-	FlyController._flying = false
-end
-
-function FlyController.isFlying()
-	return FlyController._flying
-end
-
--- =========================
--- InputManager
--- Gerencia keybind gravável e modo Toggle/Hold
--- =========================
-local InputManager = {}
-InputManager.currentKey = DEFAULTS.ToggleKey
-InputManager.inputMode = DEFAULTS.InputMode -- "Toggle" or "Hold"
-InputManager._recording = false
-InputManager._recordConn = nil
-
-function InputManager.loadFromConfig(cfg)
-	if not cfg then return end
-	if cfg.ToggleKey and typeof(cfg.ToggleKey) == "EnumItem" then
-		InputManager.currentKey = cfg.ToggleKey
-	elseif cfg.ToggleKey and type(cfg.ToggleKey) == "string" then
-		-- try convert string to Enum.KeyCode
-		local success, enum = pcall(function() return Enum.KeyCode[cfg.ToggleKey] end)
-		if success and enum then InputManager.currentKey = enum end
-	end
-	InputManager.inputMode = cfg.InputMode or InputManager.inputMode
-end
-
-function InputManager.saveToConfig(cfg)
-	if not cfg then return end
-	cfg.ToggleKey = tostring(InputManager.currentKey.Name)
-	cfg.InputMode = InputManager.inputMode
-	return cfg
-end
-
--- Start recording next key pressed (for keybind UI)
-function InputManager.startRecord(callback)
-	if InputManager._recording then return end
-	InputManager._recording = true
-	-- temporary bind to get next keyboard input
-	InputManager._recordConn = UserInputService.InputBegan:Connect(function(input, gp)
-		if gp then return end
+-- Keybind recording
+addLabel("Hotkey (press to record)")
+local hotFrame = Instance.new("Frame", scroll); hotFrame.Size = UDim2.new(1,0,0,40); hotFrame.BackgroundTransparency = 1
+local hotLbl = Instance.new("TextLabel", hotFrame); hotLbl.Size = UDim2.new(0.5,0,1,0); hotLbl.BackgroundTransparency = 1; hotLbl.Text = "Toggle Key:"; hotLbl.Font = Enum.Font.GothamSemibold; hotLbl.TextScaled = true
+local hotBtn = Instance.new("TextButton", hotFrame); hotBtn.Size = UDim2.new(0,140,0,28); hotBtn.Position = UDim2.new(1,-148,0.5,-14); hotBtn.Text = "F (Toggle)"; hotBtn.AutoButtonColor = false
+hotBtn.Activated:Connect(function()
+	hotBtn.Text = "Press a key..."
+	local conn
+	conn = UserInputService.InputBegan:Connect(function(input, processed)
+		if processed then return end
 		if input.UserInputType == Enum.UserInputType.Keyboard then
 			local key = input.KeyCode
-			InputManager.currentKey = key
-			InputManager._recording = false
-			if InputManager._recordConn then InputManager._recordConn:Disconnect(); InputManager._recordConn = nil end
-			if callback then callback(key) end
+			hotBtn.Text = tostring(key.Name) .. " (Toggle)"
+			safeFire("ToggleKey", tostring(key.Name))
+			if conn then conn:Disconnect() end
 		end
 	end)
-end
+end)
 
--- =========================
--- UIFactory: cria a GUI e retorna handles
--- =========================
-local UIFactory = {}
-function UIFactory.create()
-	-- clean old
-	local old = playerGui:FindFirstChild("FlyControlUI")
-	if old then old:Destroy() end
-
-	local screenGui = Instance.new("ScreenGui")
-	screenGui.Name = "FlyControlUI"
-	screenGui.ResetOnSpawn = false
-	screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-	screenGui.Parent = playerGui
-
-	-- main panel (scale-based responsive)
-	local panel = Instance.new("Frame", screenGui)
-	panel.Name = "Panel"
-	panel.Size = UDim2.new(0.24, 0, 0.55, 0)
-	panel.Position = UDim2.new(0.02, 0, 0.22, 0)
-	panel.BackgroundColor3 = Color3.fromRGB(255,255,255)
-	panel.BorderSizePixel = 0
-	panel.ClipsDescendants = true
-	local panelCorner = Instance.new("UICorner", panel)
-	panelCorner.CornerRadius = UDim.new(0,14)
-
-	-- titlebar
-	local titleBar = Instance.new("Frame", panel)
-	titleBar.Name = "TitleBar"
-	titleBar.Size = UDim2.new(1,0,0,48)
-	titleBar.BackgroundColor3 = Color3.fromRGB(248,248,252)
-	titleBar.BorderSizePixel = 0
-	local titleCorner = Instance.new("UICorner", titleBar)
-	titleCorner.CornerRadius = UDim.new(0,14)
-
-	local titleText = Instance.new("TextLabel", titleBar)
-	titleText.Size = UDim2.new(1, -120, 1, 0)
-	titleText.Position = UDim2.new(0, 16, 0, 0)
-	titleText.BackgroundTransparency = 1
-	titleText.Text = "Painel de Controle"
-	titleText.Font = Enum.Font.GothamBold
-	titleText.TextSize = 18
-	titleText.TextColor3 = Color3.fromRGB(30,30,40)
-	titleText.TextXAlignment = Enum.TextXAlignment.Left
-	titleText.TextScaled = true
-
-	-- minimize button
-	local minBtn = Instance.new("TextButton", titleBar)
-	minBtn.Name = "Minimize"
-	minBtn.Size = UDim2.new(0,36,0,36)
-	minBtn.Position = UDim2.new(1, -46, 0, 6)
-	minBtn.BackgroundColor3 = Color3.fromRGB(245,245,250)
-	minBtn.BorderSizePixel = 0
-	minBtn.Text = "—"
-	minBtn.Font = Enum.Font.GothamBold
-	minBtn.TextSize = 20
-	minBtn.TextColor3 = Color3.fromRGB(80,80,90)
-	minBtn.AutoButtonColor = false
-	local minCorner = Instance.new("UICorner", minBtn)
-	minCorner.CornerRadius = UDim.new(0,8)
-
-	-- content as ScrollingFrame
-	local content = Instance.new("ScrollingFrame", panel)
-	content.Name = "Content"
-	content.Size = UDim2.new(1, -24, 1, -68)
-	content.Position = UDim2.new(0, 12, 0, 56)
-	content.BackgroundTransparency = 1
-	content.ScrollBarThickness = 8
-	content.AutomaticCanvasSize = Enum.AutomaticSize.Y
-	content.ScrollBarImageColor3 = Color3.fromRGB(150,150,200)
-	content.VerticalScrollBarInset = Enum.ScrollBarInset.ScrollBar
-
-	local listLayout = Instance.new("UIListLayout", content)
-	listLayout.SortOrder = Enum.SortOrder.LayoutOrder
-	listLayout.Padding = UDim.new(0,12)
-	local padding = Instance.new("UIPadding", content)
-	padding.PaddingTop = UDim.new(0,6)
-	padding.PaddingBottom = UDim.new(0,6)
-	padding.PaddingLeft = UDim.new(0,6)
-	padding.PaddingRight = UDim.new(0,6)
-
-	-- Scroll arrows
-	local upArrow = Instance.new("TextButton", panel)
-	upArrow.Name = "UpArrow"
-	upArrow.Size = UDim2.new(0,32,0,32)
-	upArrow.Position = UDim2.new(0.5, -16, 0, 8)
-	upArrow.BackgroundColor3 = Color3.fromRGB(240,240,245)
-	upArrow.Text = "▲"
-	upArrow.Font = Enum.Font.GothamBold
-	upArrow.TextSize = 16
-	upArrow.Visible = false
-	local upCorner = Instance.new("UICorner", upArrow)
-	upCorner.CornerRadius = UDim.new(0,8)
-
-	local downArrow = Instance.new("TextButton", panel)
-	downArrow.Name = "DownArrow"
-	downArrow.Size = UDim2.new(0,32,0,32)
-	downArrow.Position = UDim2.new(0.5, -16, 1, -40)
-	downArrow.BackgroundColor3 = Color3.fromRGB(240,240,245)
-	downArrow.Text = "▼"
-	downArrow.Font = Enum.Font.GothamBold
-	downArrow.TextSize = 16
-	downArrow.Visible = false
-	local downCorner = Instance.new("UICorner", downArrow)
-	downCorner.CornerRadius = UDim.new(0,8)
-
-	-- Toggle button
-	local toggleBtn = Instance.new("TextButton", content)
-	toggleBtn.Name = "ToggleFly"
-	toggleBtn.Size = UDim2.new(1,0,0,44)
-	toggleBtn.BackgroundColor3 = Color3.fromRGB(245,245,250)
-	toggleBtn.BorderSizePixel = 0
-	toggleBtn.AutoButtonColor = false
-	toggleBtn.Text = "▶  Ativar Fly  [F]"
-	toggleBtn.Font = Enum.Font.GothamSemibold
-	toggleBtn.TextSize = 14
-	toggleBtn.TextColor3 = Color3.fromRGB(60,60,80)
-	toggleBtn.TextScaled = true
-	local toggleCorner = Instance.new("UICorner", toggleBtn)
-	toggleCorner.CornerRadius = UDim.new(0,10)
-	toggleBtn.LayoutOrder = 1
-
-	-- status row
-	local statusRow = Instance.new("Frame", content)
-	statusRow.Size = UDim2.new(1,0,0,24)
-	statusRow.BackgroundTransparency = 1
-	statusRow.LayoutOrder = 2
-	local statusDot = Instance.new("Frame", statusRow)
-	statusDot.Size = UDim2.new(0,10,0,10); statusDot.Position = UDim2.new(0,0,0,7)
-	statusDot.BackgroundColor3 = Color3.fromRGB(200,200,210)
-	statusDot.BorderSizePixel = 0
-	local sdCorner = Instance.new("UICorner", statusDot); sdCorner.CornerRadius = UDim.new(1,0)
-	local statusLabel = Instance.new("TextLabel", statusRow)
-	statusLabel.Size = UDim2.new(1,-18,1,0); statusLabel.Position = UDim2.new(0,18,0,0)
-	statusLabel.BackgroundTransparency = 1; statusLabel.Text = "Idle"
-	statusLabel.Font = Enum.Font.Gotham; statusLabel.TextSize = 14; statusLabel.TextColor3 = Color3.fromRGB(160,160,180); statusLabel.TextScaled = true
-
-	-- Helper to create sliders (returns frame)
-	local function createSlider(labelText, minVal, maxVal, default, layoutOrder)
-		local frame = Instance.new("Frame")
-		frame.Size = UDim2.new(1,0,0,64)
-		frame.BackgroundTransparency = 1
-		frame.LayoutOrder = layoutOrder
-
-		local header = Instance.new("Frame", frame)
-		header.Size = UDim2.new(1,0,0,20)
-		header.BackgroundTransparency = 1
-
-		local label = Instance.new("TextLabel", header)
-		label.Size = UDim2.new(0.6,0,1,0); label.BackgroundTransparency = 1
-		label.Text = labelText; label.Font = Enum.Font.GothamSemibold; label.TextSize = 14; label.TextColor3 = Color3.fromRGB(70,70,90); label.TextScaled = true
-
-		local numberLabel = Instance.new("TextLabel", header)
-		numberLabel.Size = UDim2.new(0.4,-6,1,0); numberLabel.Position = UDim2.new(0.6,6,0,0)
-		numberLabel.BackgroundTransparency = 1; numberLabel.Text = tostring(default)
-		numberLabel.Font = Enum.Font.GothamBold; numberLabel.TextSize = 14; numberLabel.TextColor3 = Color3.fromRGB(100,100,240); numberLabel.TextScaled = true
-		numberLabel.TextXAlignment = Enum.TextXAlignment.Right
-
-		local track = Instance.new("Frame", frame)
-		track.Name = labelText .. "Slider"
-		track.Size = UDim2.new(1,0,0,12)
-		track.Position = UDim2.new(0,0,0,32)
-		track.BackgroundColor3 = Color3.fromRGB(45,45,58); track.BorderSizePixel = 0
-		track.Active = true
-		local tc = Instance.new("UICorner", track); tc.CornerRadius = UDim.new(1,0)
-		local fill = Instance.new("Frame", track); fill.Size = UDim2.new(0,0,1,0); fill.BackgroundColor3 = Color3.fromRGB(100,100,240); fill.BorderSizePixel = 0
-		local fc = Instance.new("UICorner", fill); fc.CornerRadius = UDim.new(1,0)
-		local thumb = Instance.new("TextButton", track); thumb.Size = UDim2.new(0,20,0,20); thumb.AnchorPoint = Vector2.new(0.5,0.5)
-		thumb.Position = UDim2.new(0, 0, 0.5, 0); thumb.Text = ""; thumb.BackgroundColor3 = Color3.fromRGB(255,255,255); thumb.BorderSizePixel = 0; thumb.AutoButtonColor = false
-		local thc = Instance.new("UICorner", thumb); thc.CornerRadius = UDim.new(1,0)
-
-		-- set functions
-		local function setPercent(p)
-			p = Utils.clamp(p,0,1)
-			local value = math.floor(minVal + p * (maxVal - minVal) + 0.5)
-			numberLabel.Text = tostring(value)
-			local w = track.AbsoluteSize.X
-			local x = p * w
-			thumb.Position = UDim2.new(0, x, 0.5, 0)
-			fill.Size = UDim2.new(0, x, 1, 0)
-			return value
-		end
-
-		-- handle dragging
-		track.InputBegan:Connect(function(inp)
-			if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
-				sliderDragging = track
-				local pos = inp.Position
-				local w = track.AbsoluteSize.X
-				if w > 0 then
-					local percent = (pos.X - track.AbsolutePosition.X) / w
-					local val = setPercent(percent)
-					return val
-				end
-			end
-		end)
-		thumb.InputBegan:Connect(function(inp)
-			if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
-				sliderDragging = track
-			end
-		end)
-
-		-- initialize
-		task.defer(function()
-			local p = (default - minVal) / math.max(1, (maxVal - minVal))
-			setPercent(p)
-		end)
-
-		-- expose updateFromValue for external callback
-		frame.SetValueFromPercent = function(percent)
-			return setPercent(percent)
-		end
-
-		frame.GetTrack = function() return track end
-		frame.GetNumberLabel = function() return numberLabel end
-
-		return frame
+-- Presets (client-side minimal demo)
+addLabel("Presets (client demo)")
+local presetBox = Instance.new("TextBox", scroll); presetBox.Size = UDim2.new(0.6,0,0,28); presetBox.PlaceholderText = "Preset name"
+local savePresetBtn = Instance.new("TextButton", scroll); savePresetBtn.Size = UDim2.new(0,96,0,28); savePresetBtn.Text = "Save Preset"; savePresetBtn.AutoButtonColor = false
+local presetList = Instance.new("Frame", scroll); presetList.Size = UDim2.new(1,-12,0,80); local presetLayout = Instance.new("UIListLayout", presetList); presetLayout.FillDirection = Enum.FillDirection.Horizontal; presetLayout.Padding = UDim.new(0,8)
+savePresetBtn.Activated:Connect(function()
+	local name = tostring(presetBox.Text or ""):gsub("^%s*(.-)%s*$","%1")
+	if name == "" then presetBox.PlaceholderText = "Enter valid name"; task.delay(1.2,function() if presetBox then presetBox.PlaceholderText="Preset name" end end); return end
+	if ReplicatedStorage:FindFirstChild("PresetEvent") then
+		pcall(function() ReplicatedStorage:FindFirstChild("PresetEvent"):FireServer("Save", name, {}) end)
+	else
+		local btn = Instance.new("TextButton", presetList); btn.Size = UDim2.new(0,120,0,36); btn.Text = name; btn.AutoButtonColor = false
+		btn.MouseButton1Click:Connect(function() print("Loaded preset (client):", name) end)
+		local last = 0
+		btn.MouseButton1Click:Connect(function() local now=tick(); if now-last<0.4 then btn:Destroy() end; last=now end)
 	end
+end)
 
-	-- create sliders
-	local flySlider = createSlider("Fly Speed", LIMITS.Speed.min, LIMITS.Speed.max, DEFAULTS.FlySpeed, 3)
-	flySlider.LayoutOrder = 3; flySlider.Parent = content
-	local jumpSlider = createSlider("JumpPower", LIMITS.Jump.min, LIMITS.Jump.max, DEFAULTS.JumpPower, 4)
-	jumpSlider.LayoutOrder = 4; jumpSlider.Parent = content
-	local walkSlider = createSlider("WalkSpeed", LIMITS.Walk.min, LIMITS.Walk.max, DEFAULTS.WalkSpeed, 5)
-	walkSlider.LayoutOrder = 5; walkSlider.Parent = content
-
-	-- Keybind section (record key & mode)
-	local kbFrame = Instance.new("Frame", content)
-	kbFrame.Size = UDim2.new(1,0,0,48); kbFrame.LayoutOrder = 6; kbFrame.BackgroundTransparency = 1
-	local kbLabel = Instance.new("TextLabel", kbFrame)
-	kbLabel.Size = UDim2.new(0.5,0,1,0); kbLabel.BackgroundTransparency = 1; kbLabel.Text = "Keybind:"; kbLabel.Font = Enum.Font.GothamSemibold; kbLabel.TextScaled = true
-	local keyBtn = Instance.new("TextButton", kbFrame)
-	keyBtn.Size = UDim2.new(0.4, -6, 0.6, 0); keyBtn.Position = UDim2.new(0.5,6,0.2,0)
-	keyBtn.Text = tostring(DEFAULTS.ToggleKey.Name); keyBtn.AutoButtonColor = false; keyBtn.Font = Enum.Font.GothamBold; keyBtn.TextScaled = true
-	local modeToggle = Instance.new("TextButton", kbFrame)
-	modeToggle.Size = UDim2.new(0.12,0,0.6,0); modeToggle.Position = UDim2.new(0.92, -36, 0.2, 0)
-	modeToggle.Text = "T" -- T = Toggle, H = Hold
-	modeToggle.AutoButtonColor = false; modeToggle.Font = Enum.Font.GothamBold; modeToggle.TextScaled = true
-
-	-- Presets section (save/load)
-	local presetFrame = Instance.new("Frame", content)
-	presetFrame.Size = UDim2.new(1,0,0,140); presetFrame.LayoutOrder = 7; presetFrame.BackgroundTransparency = 1
-
-	local presetLabel = Instance.new("TextLabel", presetFrame)
-	presetLabel.Size = UDim2.new(1,0,0,20); presetLabel.BackgroundTransparency = 1; presetLabel.Text = "Presets"; presetLabel.Font = Enum.Font.GothamSemibold; presetLabel.TextScaled = true
-
-	local presetInput = Instance.new("TextBox", presetFrame)
-	presetInput.Size = UDim2.new(0.6, -6, 0, 28); presetInput.Position = UDim2.new(0, 6, 0, 30)
-	presetInput.PlaceholderText = "Nome do preset"; presetInput.Text = ""; presetInput.Font = Enum.Font.Gotham; presetInput.TextScaled = true
-
-	local savePresetBtn = Instance.new("TextButton", presetFrame)
-	savePresetBtn.Size = UDim2.new(0.2, -6, 0, 28); savePresetBtn.Position = UDim2.new(0.62, 6, 0, 30)
-	savePresetBtn.Text = "Salvar"; savePresetBtn.AutoButtonColor = false; savePresetBtn.Font = Enum.Font.GothamBold; savePresetBtn.TextScaled = true
-
-	local presetList = Instance.new("Frame", presetFrame)
-	presetList.Size = UDim2.new(1, -12, 0, 68); presetList.Position = UDim2.new(0, 6, 0, 66); presetList.BackgroundTransparency = 1
-	local presetLayout = Instance.new("UIListLayout", presetList)
-	presetLayout.FillDirection = Enum.FillDirection.Horizontal
-	presetLayout.HorizontalAlignment = Enum.HorizontalAlignment.Left
-	presetLayout.Padding = UDim.new(0,8)
-
-	-- Tooltip (shared)
-	local tooltip = Instance.new("TextLabel", screenGui)
-	tooltip.Size = UDim2.new(0,200,0,36)
-	tooltip.BackgroundColor3 = Color3.fromRGB(30,30,30)
-	tooltip.TextColor3 = Color3.fromRGB(255,255,255)
-	tooltip.TextScaled = true
-	tooltip.Visible = false
-	tooltip.AnchorPoint = Vector2.new(0.5, 1)
-	tooltip.ZIndex = 1000
-	local tipCorner = Instance.new("UICorner", tooltip)
-	tipCorner.CornerRadius = UDim.new(0,8)
-	tooltip.BackgroundTransparency = 0.15
-
-	-- Bubble (minimized)
-	local bubble = Instance.new("TextButton", screenGui)
-	bubble.Name = "MinimizedBubble"
-	bubble.Size = UDim2.new(0, 64, 0, 64)
-	bubble.BackgroundColor3 = Color3.fromRGB(100,100,240)
-	bubble.Text = "⦿"
-	bubble.Font = Enum.Font.GothamBold
-	bubble.TextSize = 32
-	bubble.TextColor3 = Color3.fromRGB(255,255,255)
-	bubble.BorderSizePixel = 0
-	bubble.Visible = false
-	local bubbleCorner = Instance.new("UICorner", bubble)
-	bubbleCorner.CornerRadius = UDim.new(1,0)
-
-	-- return handles
-	return {
-		ScreenGui = screenGui,
-		Panel = panel,
-		TitleBar = titleBar,
-		MinimizeBtn = minBtn,
-		Content = content,
-		ListLayout = listLayout,
-		UpArrow = upArrow,
-		DownArrow = downArrow,
-		ToggleBtn = toggleBtn,
-		StatusDot = statusDot,
-		StatusLabel = statusLabel,
-		FlySlider = flySlider,
-		JumpSlider = jumpSlider,
-		WalkSlider = walkSlider,
-		KeyBtn = keyBtn,
-		ModeToggle = modeToggle,
-		PresetInput = presetInput,
-		SavePresetBtn = savePresetBtn,
-		PresetList = presetList,
-		Tooltip = tooltip,
-		Bubble = bubble
-	}
-end
-
--- =========================
--- Controller: orquestra tudo
--- =========================
-local Controller = {}
-function Controller:init()
-	-- load config
-	self.config = SettingsManager.loadConfig()
-	InputManager.loadFromConfig(self.config)
-
-	-- create UI
-	self.ui = UIFactory.create()
-	self.screenGui = self.ui.ScreenGui
-	self.panel = self.ui.Panel
-	self.content = self.ui.Content
-	self.flySlider = self.ui.FlySlider
-	self.jumpSlider = self.ui.JumpSlider
-	self.walkSlider = self.ui.WalkSlider
-	self.toggleBtn = self.ui.ToggleBtn
-	self.statusDot = self.ui.StatusDot
-	self.statusLabel = self.ui.StatusLabel
-	self.minBtn = self.ui.MinimizeBtn
-	self.upArrow = self.ui.UpArrow
-	self.downArrow = self.ui.DownArrow
-	self.keyBtn = self.ui.KeyBtn
-	self.modeToggle = self.ui.ModeToggle
-	self.presetInput = self.ui.PresetInput
-	self.savePresetBtn = self.ui.SavePresetBtn
-	self.presetList = self.ui.PresetList
-	self.tooltip = self.ui.Tooltip
-	self.bubble = self.ui.Bubble
-
-	-- state
-	self.flying = false
-	self.connections = {}
-	self.sliderDragging = nil
-
-	-- apply loaded config to sliders & UI
-	self:applyConfigToUI()
-
-	-- connect events
-	self:connectUI()
-	-- update arrows first time (defer for layout)
-	task.defer(function() self:updateScrollArrows() end)
-	-- load presets into UI
-	self:refreshPresetButtons()
-end
-
-function Controller:applyConfigToUI()
-	-- set slider initial values from config (or defaults)
-	local cfg = self.config
-	-- fly slider percent
-	local pFly = (cfg.FlySpeed or DEFAULTS.FlySpeed - LIMITS.Speed.min) / math.max(1, LIMITS.Speed.max - LIMITS.Speed.min)
-	self.flySlider.SetValueFromPercent((cfg.FlySpeed or DEFAULTS.FlySpeed - LIMITS.Speed.min) / math.max(1, LIMITS.Speed.max - LIMITS.Speed.min))
-	-- set number labels directly as fallback
-	local function setLabelFromSlider(slider, val)
-		local lbl = slider:GetNumberLabel()
-		if lbl then lbl.Text = tostring(val) end
+-- Minimize bubble and panel drag/snap
+local bubble = Instance.new("TextButton", screenGui); bubble.Size = UDim2.new(0,64,0,64); bubble.BackgroundColor3 = Color3.fromRGB(100,100,240); bubble.Text="⦿"; bubble.Visible=false; bubble.AutoButtonColor=false; local bcorner = Instance.new("UICorner", bubble); bcorner.CornerRadius = UDim.new(1,0)
+minBtn.Activated:Connect(function()
+	if panel.Visible then
+		local abs = panel.AbsolutePosition; local bw = bubble.AbsoluteSize.X; local vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1280,720)
+		local bx = math.clamp(abs.X + panel.AbsoluteSize.X - bw - 8, 8, vp.X - bw - 8)
+		local by = math.clamp(abs.Y + 8, 8, vp.Y - bubble.AbsoluteSize.Y - 8)
+		bubble.Position = UDim2.new(0, bx, 0, by); bubble.Visible = true
+		TweenService:Create(panel, TweenInfo.new(0.18), {Size = UDim2.new(0, 220, 0, 80)}):Play()
+		task.delay(0.18, function() panel.Visible=false; panel.Size=UDim2.new(0,420,0,520) end)
+	else
+		panel.Visible = true; bubble.Visible = false
 	end
-	-- update sliders with saved values
-	if cfg.FlySpeed then
-		local p = (cfg.FlySpeed - LIMITS.Speed.min)/math.max(1, LIMITS.Speed.max - LIMITS.Speed.min)
-		self.flySlider.SetValueFromPercent(p)
-	end
-	if cfg.JumpPower then
-		local p = (cfg.JumpPower - LIMITS.Jump.min)/math.max(1, LIMITS.Jump.max - LIMITS.Jump.min)
-		self.jumpSlider.SetValueFromPercent(p)
-	end
-	if cfg.WalkSpeed then
-		local p = (cfg.WalkSpeed - LIMITS.Walk.min)/math.max(1, LIMITS.Walk.max - LIMITS.Walk.min)
-		self.walkSlider.SetValueFromPercent(p)
-	end
+end)
+bubble.Activated:Connect(function() panel.Visible = true; bubble.Visible = false end)
 
-	-- key button
-	self.keyBtn.Text = (self.config.ToggleKey and tostring(self.config.ToggleKey) or tostring(InputManager.currentKey.Name))
-	-- mode toggle text
-	self.modeToggle.Text = (self.config.InputMode == "Hold") and "H" or "T"
-end
-
-function Controller:connectUI()
-	-- store conns for cleanup
-	local function watch(conn) table.insert(self.connections, conn) end
-
-	-- Hover tooltips helper
-	local function attachTooltip(inst, text)
-		if not inst then return end
-		inst.MouseEnter:Connect(function()
-			local pos = UserInputService:GetMouseLocation()
-			self.tooltip.Text = text
-			self.tooltip.Position = UDim2.new(0, pos.X, 0, pos.Y - 8)
-			self.tooltip.Visible = true
-		end)
-		inst.MouseLeave:Connect(function() self.tooltip.Visible = false end)
-	end
-
-	attachTooltip(self.toggleBtn, "Ativa/Desativa o fly\nAtalho: " .. tostring(InputManager.currentKey.Name))
-	attachTooltip(self.minBtn, "Minimizar")
-	attachTooltip(self.bubble, "Restaurar painel")
-	attachTooltip(self.savePresetBtn, "Salvar preset atual")
-
-	-- toggle fly button
-	local function setUIFlying(state)
-		local tweenInfo = TweenInfo.new(0.18, Enum.EasingStyle.Quad)
-		if state then
-			Utils.tween(self.toggleBtn, {BackgroundColor3 = Color3.fromRGB(100,100,240), TextColor3 = Color3.fromRGB(255,255,255)}, 0.18)
-			Utils.tween(self.statusDot, {BackgroundColor3 = Color3.fromRGB(100,220,130)}, 0.18)
-			self.toggleBtn.Text = "■  Desativar Fly  [" .. tostring(InputManager.currentKey.Name) .. "]"
-			self.statusLabel.Text = "Flying"
-			self.statusLabel.TextColor3 = Color3.fromRGB(80,180,110)
-		else
-			Utils.tween(self.toggleBtn, {BackgroundColor3 = Color3.fromRGB(245,245,250), TextColor3 = Color3.fromRGB(60,60,80)}, 0.18)
-			Utils.tween(self.statusDot, {BackgroundColor3 = Color3.fromRGB(200,200,210)}, 0.18)
-			self.toggleBtn.Text = "▶  Ativar Fly  [" .. tostring(InputManager.currentKey.Name) .. "]"
-			self.statusLabel.Text = "Idle"
-			self.statusLabel.TextColor3 = Color3.fromRGB(160,160,180)
-		end
-	end
-
-	-- internal heartbeat to update movement when flying
-	local hbConn = RunService.Heartbeat:Connect(function()
-		if not FlyController.isFlying() or not FlyController.bodyVel then return end
-		local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-		if not root then return end
-		local cam = workspace.CurrentCamera
-		if not cam then return end
-		-- build input direction
-		local dir = Vector3.new(0,0,0)
-		if UserInputService:IsKeyDown(Enum.KeyCode.W) or UserInputService:IsKeyDown(Enum.KeyCode.Up) then dir += Vector3.new(0,0,-1) end
-		if UserInputService:IsKeyDown(Enum.KeyCode.S) or UserInputService:IsKeyDown(Enum.KeyCode.Down) then dir += Vector3.new(0,0,1) end
-		if UserInputService:IsKeyDown(Enum.KeyCode.A) or UserInputService:IsKeyDown(Enum.KeyCode.Left) then dir += Vector3.new(-1,0,0) end
-		if UserInputService:IsKeyDown(Enum.KeyCode.D) or UserInputService:IsKeyDown(Enum.KeyCode.Right) then dir += Vector3.new(1,0,0) end
-		if UserInputService:IsKeyDown(Enum.KeyCode.Space) then dir += Vector3.new(0,1,0) end
-		if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.RightControl) then dir += Vector3.new(0,-1,0) end
-
-		local sprinting = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
-		local sp = (self.config.FlySpeed or DEFAULTS.FlySpeed)
-		local speed = sprinting and sp * (self.config.SprintMult or DEFAULTS.SprintMult) or sp
-
-		if dir.Magnitude > 0 then
-			local world = cam.CFrame:VectorToWorldSpace(dir).Unit
-			FlyController.bodyVel.Velocity = world * speed
-			local lookDir = Vector3.new(world.X, 0, world.Z)
-			if lookDir.Magnitude > 0.01 then
-				FlyController.bodyGyro.CFrame = CFrame.lookAt(root.Position, root.Position + lookDir)
-			end
-		else
-			FlyController.bodyVel.Velocity = FlyController.bodyVel.Velocity * 0.85
-		end
+-- bubble drag + snap
+do
+	local dragging=false; local sPos, sBubble
+	bubble.InputBegan:Connect(function(inp)
+		if inp.UserInputType==Enum.UserInputType.MouseButton1 then dragging=true; sPos=inp.Position; sBubble=bubble.Position end
 	end)
-	watch(hbConn)
-
-	-- toggle button action
-	self.toggleBtn.Activated:Connect(function()
-		if FlyController.isFlying() then
-			FlyController.disable()
-			setUIFlying(false)
-		else
-			FlyController.enable()
-			setUIFlying(true)
-		end
-	end)
-
-	-- key input handling (Toggle vs Hold)
-	local kbConn = UserInputService.InputBegan:Connect(function(input, processed)
-		if processed then return end
-		if input.UserInputType == Enum.UserInputType.Keyboard then
-			if input.KeyCode == InputManager.currentKey then
-				-- depending on mode
-				if InputManager.inputMode == "Toggle" then
-					if FlyController.isFlying() then FlyController.disable(); setUIFlying(false)
-					else FlyController.enable(); setUIFlying(true) end
-				else -- Hold
-					if not FlyController.isFlying() then FlyController.enable(); setUIFlying(true) end
-				end
-			end
-		end
-	end)
-	watch(kbConn)
-
-	local kbUpConn = UserInputService.InputEnded:Connect(function(input, processed)
-		if processed then return end
-		if input.UserInputType == Enum.UserInputType.Keyboard then
-			if input.KeyCode == InputManager.currentKey and InputManager.inputMode == "Hold" then
-				-- stop flying when key released
-				if FlyController.isFlying() then FlyController.disable(); setUIFlying(false) end
-			end
-		end
-	end)
-	watch(kbUpConn)
-
-	-- slider input handling (global InputChanged)
-	local ic = UserInputService.InputChanged:Connect(function(input)
-		if not sliderDragging then return end
-		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-			local track = sliderDragging
-			local trackWidth = track.AbsoluteSize.X
-			if trackWidth <= 0 then return end
-			local percent = (input.Position.X - track.AbsolutePosition.X) / trackWidth
-			percent = Utils.clamp(percent, 0, 1)
-			-- determine which slider
-			local name = track.Name
-			local val
-			if name == "Fly SpeedSlider" then
-				val = math.floor(LIMITS.Speed.min + percent * (LIMITS.Speed.max - LIMITS.Speed.min) + 0.5)
-				-- update UI fill/thumb
-				local thumb = track:FindFirstChildOfClass("TextButton")
-				local fill = track:FindFirstChildOfClass("Frame")
-				if thumb then thumb.Position = UDim2.new(0, percent * trackWidth, 0.5, 0) end
-				if fill then fill.Size = UDim2.new(percent, 0, 1, 0) end
-				self.config.FlySpeed = val
-			elseif name == "JumpPowerSlider" then
-				val = math.floor(LIMITS.Jump.min + percent * (LIMITS.Jump.max - LIMITS.Jump.min) + 0.5)
-				local thumb = track:FindFirstChildOfClass("TextButton")
-				local fill = track:FindFirstChildOfClass("Frame")
-				if thumb then thumb.Position = UDim2.new(0, percent * trackWidth, 0.5, 0) end
-				if fill then fill.Size = UDim2.new(percent, 0, 1, 0) end
-				self.config.JumpPower = val
-			elseif name == "WalkSpeedSlider" then
-				val = math.floor(LIMITS.Walk.min + percent * (LIMITS.Walk.max - LIMITS.Walk.min) + 0.5)
-				local thumb = track:FindFirstChildOfClass("TextButton")
-				local fill = track:FindFirstChildOfClass("Frame")
-				if thumb then thumb.Position = UDim2.new(0, percent * trackWidth, 0.5, 0) end
-				if fill then fill.Size = UDim2.new(percent, 0, 1, 0) end
-				self.config.WalkSpeed = val
-			end
-			-- apply to humanoid
-			local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
-			if humanoid then
-				if self.config.JumpPower then humanoid.UseJumpPower = true; humanoid.JumpPower = self.config.JumpPower end
-				if self.config.WalkSpeed then humanoid.WalkSpeed = self.config.WalkSpeed end
-			end
-			-- save config
-			SettingsManager.saveConfig(self.config)
-		end
-	end)
-	watch(ic)
-
-	-- InputEnded for slider drag stop
-	local ie = UserInputService.InputEnded:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-			sliderDragging = nil
-		end
-	end)
-	watch(ie)
-
-	-- attach InputBegan listeners to sliders (we created them in UIFactory)
-	-- We need to find the track frames and attach InputBegan to update sliderDragging variable
-	local function attachSliderListeners(sliderFrame)
-		if not sliderFrame then return end
-		local track = sliderFrame:GetTrack()
-		if track then
-			track.InputBegan:Connect(function(inp)
-				if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
-					sliderDragging = track
-					-- simulate immediate update
-					local pos = inp.Position
-					local trackWidth = track.AbsoluteSize.X
-					if trackWidth > 0 then
-						local percent = (pos.X - track.AbsolutePosition.X) / trackWidth
-						percent = Utils.clamp(percent, 0, 1)
-						-- call InputChanged manually by setting sliderDragging and using InputChanged handler above (works on next movement)
-					end
-				end
-			end)
-			local thumb = track:FindFirstChildOfClass("TextButton")
-			if thumb then
-				thumb.InputBegan:Connect(function(inp)
-					if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
-						sliderDragging = track
-					end
-				end)
-			end
-		end
-	end
-	attachSliderListeners(self.flySlider)
-	attachSliderListeners(self.jumpSlider)
-	attachSliderListeners(self.walkSlider)
-
-	-- Minimize button
-	self.minBtn.Activated:Connect(function()
-		if self.panel.Visible and not self.panel:IsDescendantOf(game) then return end
-		if self.panel.Visible then
-			-- store position
-			self.savedPanelPosition = self.panel.Position
-			-- compute bubble pos near panel corner
-			local abs = self.panel.AbsolutePosition
-			local bw = self.bubble.AbsoluteSize.X
+	UserInputService.InputChanged:Connect(function(inp)
+		if dragging and inp.UserInputType==Enum.UserInputType.MouseMovement then
+			local d = inp.Position - sPos
+			local newX = sBubble.X.Offset + d.X; local newY = sBubble.Y.Offset + d.Y
 			local vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1280,720)
-			local bx = math.clamp(abs.X + self.panel.AbsoluteSize.X - bw - 8, 8, vp.X - bw - 8)
-			local by = math.clamp(abs.Y + 8, 8, vp.Y - self.bubble.AbsoluteSize.Y - 8)
-			self.bubble.Position = UDim2.new(0, bx, 0, by)
-			self.bubble.Visible = true
-			Utils.tween(self.panel, {Size = UDim2.new(0.16,0,0.1,0)}, 0.18)
-			task.delay(0.18, function()
-				self.panel.Visible = false
-				self.panel.Size = UDim2.new(0.24,0,0.55,0)
-			end)
-		else
-			-- restore
-			self.panel.Position = self.savedPanelPosition or UDim2.new(0.02,0,0.22,0)
-			self.panel.Visible = true
-			self.bubble.Visible = false
+			local ox = math.clamp(newX, 8, vp.X - bubble.AbsoluteSize.X - 8)
+			local oy = math.clamp(newY, 8, vp.Y - bubble.AbsoluteSize.Y - 8)
+			bubble.Position = UDim2.new(0, ox, 0, oy)
 		end
 	end)
-
-	-- Bubble drag & snap
-	local draggingBubble = false
-	local bubbleStartPos, bubbleDragStart = nil, nil
-	self.bubble.InputBegan:Connect(function(inp)
-		if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
-			draggingBubble = true
-			bubbleDragStart = inp.Position
-			bubbleStartPos = self.bubble.Position
-		end
-	end)
-	local bubbleChangedConn = UserInputService.InputChanged:Connect(function(inp)
-		if draggingBubble and (inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch) then
-			local delta = inp.Position - bubbleDragStart
-			local newX = bubbleStartPos.X.Offset + delta.X
-			local newY = bubbleStartPos.Y.Offset + delta.Y
-			local vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1280,720)
-			local ox = math.clamp(newX, 8, vp.X - self.bubble.AbsoluteSize.X - 8)
-			local oy = math.clamp(newY, 8, vp.Y - self.bubble.AbsoluteSize.Y - 8)
-			self.bubble.Position = UDim2.new(0, ox, 0, oy)
-		end
-	end)
-	watch(bubbleChangedConn)
 	UserInputService.InputEnded:Connect(function(inp)
-		if draggingBubble and (inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch) then
-			-- snap to nearest edge
+		if dragging and inp.UserInputType==Enum.UserInputType.MouseButton1 then
 			local vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1280,720)
-			local centerX = self.bubble.AbsolutePosition.X + self.bubble.AbsoluteSize.X/2
-			local centerY = self.bubble.AbsolutePosition.Y + self.bubble.AbsoluteSize.Y/2
-			local leftDist = centerX
-			local rightDist = vp.X - centerX
-			local topDist = centerY
-			local bottomDist = vp.Y - centerY
-			local minEdge = math.min(leftDist, rightDist, topDist, bottomDist)
-			local targetX, targetY = self.bubble.AbsolutePosition.X, self.bubble.AbsolutePosition.Y
-			if minEdge == leftDist then
-				targetX = 8
-			elseif minEdge == rightDist then
-				targetX = vp.X - self.bubble.AbsoluteSize.X - 8
-			elseif minEdge == topDist then
-				targetY = 8
-			else
-				targetY = vp.Y - self.bubble.AbsoluteSize.Y - 8
-			end
-			Utils.tween(self.bubble, {Position = UDim2.new(0, targetX, 0, targetY)}, 0.18)
+			local cx = bubble.AbsolutePosition.X + bubble.AbsoluteSize.X/2; local cy = bubble.AbsolutePosition.Y + bubble.AbsoluteSize.Y/2
+			local left, right, top, bottom = cx, vp.X - cx, cy, vp.Y - cy
+			local minEdge = math.min(left, right, top, bottom)
+			local tx, ty = bubble.AbsolutePosition.X, bubble.AbsolutePosition.Y
+			if minEdge==left then tx=8 elseif minEdge==right then tx=vp.X - bubble.AbsoluteSize.X - 8 elseif minEdge==top then ty=8 else ty=vp.Y - bubble.AbsoluteSize.Y - 8 end
+			TweenService:Create(bubble, TweenInfo.new(0.18), {Position = UDim2.new(0, tx, 0, ty)}):Play()
 		end
-		draggingBubble = false
+		dragging=false
 	end)
+end
 
-	-- bubble click restores
-	self.bubble.Activated:Connect(function() 
-		self.panel.Visible = true
-		self.bubble.Visible = false
+-- panel dragging (titlebar)
+do
+	local dragging=false; local sPos, pPos
+	titleBar.InputBegan:Connect(function(inp)
+		if inp.UserInputType==Enum.UserInputType.MouseButton1 then dragging=true; sPos=inp.Position; pPos=panel.Position end
 	end)
-
-	-- set keybind recording UI
-	self.keyBtn.Activated:Connect(function()
-		-- start recording next key
-		self.keyBtn.Text = "Pressione uma tecla..."
-		InputManager.startRecord(function(key)
-			-- update current key and config, save
-			self.config.ToggleKey = tostring(key.Name)
-			InputManager.currentKey = key
-			-- update text
-			self.keyBtn.Text = tostring(key.Name)
-			-- save config
-			SettingsManager.saveConfig(self.config)
-		end)
-	end)
-
-	-- mode toggle between Toggle/Hold
-	self.modeToggle.Activated:Connect(function()
-		if InputManager.inputMode == "Toggle" then
-			InputManager.inputMode = "Hold"
-			self.modeToggle.Text = "H"
-		else
-			InputManager.inputMode = "Toggle"
-			self.modeToggle.Text = "T"
+	UserInputService.InputChanged:Connect(function(inp)
+		if dragging and inp.UserInputType==Enum.UserInputType.MouseMovement then
+			local d = inp.Position - sPos
+			panel.Position = UDim2.new(pPos.X.Scale, pPos.X.Offset + d.X, pPos.Y.Scale, pPos.Y.Offset + d.Y)
 		end
-		self.config.InputMode = InputManager.inputMode
-		SettingsManager.saveConfig(self.config)
 	end)
+	UserInputService.InputEnded:Connect(function(inp) if inp.UserInputType==Enum.UserInputType.MouseButton1 then dragging=false end end)
+end
 
-	-- Save preset
-	self.savePresetBtn.Activated:Connect(function()
-		local name = tostring(self.presetInput.Text or ""):gsub("^%s*(.-)%s*$","%1")
-		if name == "" then
-			-- quick feedback
-			self.presetInput.Text = ""
-			self.presetInput.PlaceholderText = "Informe um nome válido"
-			task.delay(1.2, function() if self.presetInput then self.presetInput.PlaceholderText = "Nome do preset" end end)
-			return
+-- FPS & ping updates
+do
+	local last = tick(); local frames=0
+	RunService.RenderStepped:Connect(function()
+		frames = frames + 1
+		if tick() - last >= 1 then
+			local fps = math.floor(frames / (tick() - last))
+			frames = 0; last = tick()
+			pcall(function() fpsBadge.Text = "FPS: " .. tostring(fps) end)
 		end
-		local preset = {
-			FlySpeed = self.config.FlySpeed or DEFAULTS.FlySpeed,
-			JumpPower = self.config.JumpPower or DEFAULTS.JumpPower,
-			WalkSpeed = self.config.WalkSpeed or DEFAULTS.WalkSpeed,
-			SprintMult = self.config.SprintMult or DEFAULTS.SprintMult,
-			ToggleKey = tostring(InputManager.currentKey.Name),
-			InputMode = InputManager.inputMode
-		}
-		SettingsManager.savePreset(name, preset)
-		self:refreshPresetButtons()
-		self.presetInput.Text = ""
 	end)
-
-	-- preset buttons refresh
-	function self:refreshPresetButtons()
-		-- clear children
-		for _,c in ipairs(self.presetList:GetChildren()) do
-			if not c:IsA("UIListLayout") then pcall(function() c:Destroy() end) end
-		end
-		local presets = SettingsManager.getPresets()
-		for name, data in pairs(presets) do
-			local btn = Instance.new("TextButton", self.presetList)
-			btn.Size = UDim2.new(0, 120, 0, 36)
-			btn.BackgroundColor3 = Color3.fromRGB(240,240,245)
-			btn.Text = name
-			btn.Font = Enum.Font.Gotham
-			btn.TextScaled = true
-			btn.AutoButtonColor = false
-			local btnCorner = Instance.new("UICorner", btn)
-			btn.Activated:Connect(function()
-				-- load preset
-				self.config.FlySpeed = data.FlySpeed or self.config.FlySpeed
-				self.config.JumpPower = data.JumpPower or self.config.JumpPower
-				self.config.WalkSpeed = data.WalkSpeed or self.config.WalkSpeed
-				self.config.SprintMult = data.SprintMult or self.config.SprintMult
-				-- key & mode
-				local keyname = data.ToggleKey
-				if keyname and type(keyname) == "string" then
-					local ok, enum = pcall(function() return Enum.KeyCode[keyname] end)
-					if ok and enum then InputManager.currentKey = enum end
-				end
-				InputManager.inputMode = data.InputMode or InputManager.inputMode
-				-- apply to UI
-				self.keyBtn.Text = tostring(InputManager.currentKey.Name)
-				self.modeToggle.Text = (InputManager.inputMode == "Hold") and "H" or "T"
-				-- update sliders visually
-				if self.config.FlySpeed then
-					local p = (self.config.FlySpeed - LIMITS.Speed.min)/math.max(1, (LIMITS.Speed.max - LIMITS.Speed.min))
-					self.flySlider.SetValueFromPercent(p)
-				end
-				if self.config.JumpPower then
-					local p = (self.config.JumpPower - LIMITS.Jump.min)/math.max(1, (LIMITS.Jump.max - LIMITS.Jump.min))
-					self.jumpSlider.SetValueFromPercent(p)
-				end
-				if self.config.WalkSpeed then
-					local p = (self.config.WalkSpeed - LIMITS.Walk.min)/math.max(1, (LIMITS.Walk.max - LIMITS.Walk.min))
-					self.walkSlider.SetValueFromPercent(p)
-				end
-				-- apply to humanoid now
-				local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
-				if humanoid then
-					if self.config.JumpPower then humanoid.UseJumpPower = true; humanoid.JumpPower = self.config.JumpPower end
-					if self.config.WalkSpeed then humanoid.WalkSpeed = self.config.WalkSpeed end
-				end
-				-- save config
-				SettingsManager.saveConfig(self.config)
-			end)
-			-- right-click for delete/rename (simple: double click to delete)
-			local lastClick = 0
-			btn.MouseButton1Click:Connect(function()
-				local now = tick()
-				if now - lastClick < 0.4 then
-					-- double click -> delete
-					SettingsManager.deletePreset(name)
-					self:refreshPresetButtons()
-				end
-				lastClick = now
-			end)
-		end
-	end
-
-	-- scroll arrows behavior
-	self.content:GetPropertyChangedSignal("CanvasPosition"):Connect(function() self:updateScrollArrows() end)
-	self.content:GetPropertyChangedSignal("CanvasSize"):Connect(function() self:updateScrollArrows() end)
-	self.upArrow.Activated:Connect(function()
-		-- scroll up a page
-		local ypos = math.max(0, self.content.CanvasPosition.Y - self.content.AbsoluteWindowSize.Y + 40)
-		self.content.CanvasPosition = Vector2.new(0, ypos)
-	end)
-	self.downArrow.Activated:Connect(function()
-		local ypos = math.min(math.max(0, self.content.CanvasSize.Y.Offset - self.content.AbsoluteWindowSize.Y), self.content.CanvasPosition.Y + self.content.AbsoluteWindowSize.Y - 40)
-		self.content.CanvasPosition = Vector2.new(0, ypos)
-	end)
-
-	-- update arrows initial
-	self:updateScrollArrows()
-
-	-- cleanup on GUI destroy
-	self.screenGui.Destroying:Connect(function()
-		-- stop flying & restore collisions
-		if FlyController.isFlying() then FlyController.disable() end
-		-- cleanup any connections
-		for _,c in ipairs(self.connections) do
-			if c and typeof(c) == "RBXScriptConnection" and c.Connected then c:Disconnect() end
+	spawn(function()
+		while screenGui and screenGui.Parent do
+			local p = measurePing()
+			if p then pcall(function() pingBadge.Text = "Ping: " .. tostring(p) .. "ms" end) end
+			wait(2)
 		end
 	end)
 end
 
--- update scroll arrows function
-function Controller:updateScrollArrows()
-	local content = self.content
-	if not content or not content:IsA("ScrollingFrame") then return end
-	-- short delay for layout stabilization
-	task.defer(function()
-		local canScroll = content.CanvasSize.Y.Offset > content.AbsoluteWindowSize.Y + 4
-		if not canScroll then
-			self.upArrow.Visible = false
-			self.downArrow.Visible = false
-			return
-		end
-		local y = content.CanvasPosition.Y
-		local maxY = math.max(0, content.CanvasSize.Y.Offset - content.AbsoluteWindowSize.Y)
-		self.upArrow.Visible = (y > 2)
-		self.downArrow.Visible = (y < maxY - 2)
-	end)
+print("[DevMenuClient] UI injected and running (client).")
+]]
+
+-- On player added: inject the LocalScript into their PlayerGui (so it runs client-side)
+local function onPlayerAdded(player)
+	-- wait for PlayerGui
+	local gui = player:WaitForChild("PlayerGui")
+	-- create LocalScript
+	local ls = Instance.new("LocalScript")
+	ls.Name = "DevMenu_injected"
+	ls.Source = clientSource
+	ls.Parent = gui
 end
 
--- =========================
--- Inicialização
--- =========================
-local controller = {}
-setmetatable(controller, {__index = Controller})
-controller:init()
-
--- Save current slider values periodically or on change (we saved on slider updates already)
--- Ensure config gets saved when changing sliders via UI by calling SettingsManager.saveConfig when values change.
--- For safety, ensure config has keys set from UI on start
-local function syncConfigFromUI()
-	controller.config.FlySpeed = controller.config.FlySpeed or DEFAULTS.FlySpeed
-	controller.config.JumpPower = controller.config.JumpPower or DEFAULTS.JumpPower
-	controller.config.WalkSpeed = controller.config.WalkSpeed or DEFAULTS.WalkSpeed
-	controller.config.SprintMult = controller.config.SprintMult or DEFAULTS.SprintMult
-	controller.config.ToggleKey = controller.config.ToggleKey or tostring(InputManager.currentKey.Name)
-	controller.config.InputMode = controller.config.InputMode or InputManager.inputMode
-	SettingsManager.saveConfig(controller.config)
+-- For players already in game (Studio Play), inject
+for _,p in ipairs(Players:GetPlayers()) do
+	onPlayerAdded(p)
 end
-syncConfigFromUI()
+Players.PlayerAdded:Connect(onPlayerAdded)
 
--- Expose global convenience for dev console
-_G.FlyControl = {
-	Enable = function() FlyController.enable() end,
-	Disable = function() FlyController.disable() end,
-	Toggle = function() if FlyController.isFlying() then FlyController.disable() else FlyController.enable() end end,
-	IsFlying = function() return FlyController.isFlying() end,
-	SaveSettings = function() SettingsManager.saveConfig(controller.config) end,
-	LoadSettings = function() controller.config = SettingsManager.loadConfig(); controller:applyConfigToUI() end,
-	SettingsManager = SettingsManager
-}
-
-print("[FlyControl] UI loaded. Use _G.FlyControl.Toggle() to test from console.")
+print("[DevMenu_AllInOne] installed. Remotes ready and LocalScript will be injected into each PlayerGui.")
