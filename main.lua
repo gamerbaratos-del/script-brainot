@@ -1,749 +1,1156 @@
--- FlyControl.lua (versão melhorada: responsiva, minimizar->bubble com snap, salvar configs, hover animations, limpeza)
+-- FlyControl.lua
+-- LocalScript (colocar em StarterPlayerScripts ou StarterCharacterScripts conforme preferir)
+-- Versão: completa com UI responsiva, minimizar->bubble com snap, scroll arrows, presets, keybinds, tooltips, e "atravessar" via PhysicsService.
+-- OBS: Presets são salvos nas Attributes do Player (persistem na sessão). Para persistência entre sessões, adicione um RemoteEvent + DataStore no servidor.
+
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local PhysicsService = game:GetService("PhysicsService")
 local HttpService = game:GetService("HttpService")
+
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
+local camera = workspace.CurrentCamera
 
--- Defaults
-local DEFAULT_FLY_SPEED = 60
-local DEFAULT_SPRINT_MULT = 2.5
-local TOGGLE_KEY = Enum.KeyCode.F
+-- =========================
+-- Configurações padrão
+-- =========================
+local DEFAULTS = {
+	FlySpeed = 60,
+	SprintMult = 2.5,
+	JumpPower = 50,
+	WalkSpeed = 16,
+	ToggleKey = Enum.KeyCode.F,
+	InputMode = "Toggle" -- "Toggle" or "Hold"
+}
 
-local SPEED_MIN, SPEED_MAX = 1, 1000
-local JUMP_MIN, JUMP_MAX = 0, 3000
-local WALK_MIN, WALK_MAX = 0, 3000
+local LIMITS = {
+	Speed = {min = 1, max = 1000},
+	Jump = {min = 0, max = 3000},
+	Walk = {min = 0, max = 3000}
+}
 
-local FLY_SPEED = DEFAULT_FLY_SPEED
-local SPRINT_MULT = DEFAULT_SPRINT_MULT
-local jumpPowerValue = 50
-local walkSpeedValue = 16
+-- =========================
+-- Util (helpers)
+-- =========================
+local Utils = {}
+function Utils.clamp(v, a, b) return math.clamp(v, a, b) end
 
--- Flight state
-local flying = false
-local bodyVel, bodyGyro = nil, nil
-
--- Collision group (no collide while flying)
-local COLLISION_GROUP = "FlyNoCollide"
-local noCollideConn = nil
-local modifiedParts = {} -- map part -> original CanCollide
-
--- UI state
-local sliderDragging = nil
-local minimized = false
-local savedPanelPosition = nil
-
--- Connection tracking for cleanup
-local connections = {}
-
-local function addConn(conn)
-	if conn then table.insert(connections, conn) end
+-- Tween helper
+function Utils.tween(instance, props, time, style, dir)
+	time = time or 0.18
+	style = style or Enum.EasingStyle.Quad
+	dir = dir or Enum.EasingDirection.Out
+	local info = TweenInfo.new(time, style, dir)
+	local t = TweenService:Create(instance, info, props)
+	t:Play()
+	return t
 end
 
-local function cleanupConnections()
-	for _, c in ipairs(connections) do
-		if c and typeof(c) == "RBXScriptConnection" and c.Connected then
-			c:Disconnect()
-		end
+function Utils.copyTable(t)
+	local out = {}
+	for k,v in pairs(t) do out[k]=v end
+	return out
+end
+
+-- JSON encode/decode safe
+function Utils.safeEncode(t)
+	local ok, s = pcall(function() return HttpService:JSONEncode(t) end)
+	if ok then return s end
+	return nil
+end
+function Utils.safeDecode(s)
+	local ok, t = pcall(function() return HttpService:JSONDecode(s) end)
+	if ok then return t end
+	return nil
+end
+
+-- =========================
+-- SettingsManager (atributos de player)
+-- Presets armazenados em Attribute "FlyControl_Presets" (JSON: {name->tbl})
+-- Config atual em Attribute "FlyControl_Config" (JSON)
+-- =========================
+local SettingsManager = {}
+function SettingsManager.loadConfig()
+	local raw = player:GetAttribute("FlyControl_Config")
+	if type(raw) ~= "string" then
+		return Utils.copyTable(DEFAULTS)
 	end
-	connections = {}
+	local tbl = Utils.safeDecode(raw)
+	if type(tbl) ~= "table" then
+		return Utils.copyTable(DEFAULTS)
+	end
+	-- ensure defaults
+	for k,v in pairs(DEFAULTS) do
+		if tbl[k] == nil then tbl[k] = v end
+	end
+	return tbl
 end
 
--- Ensure collision group exists and set non-collidable rules
-local function ensureCollisionGroup()
+function SettingsManager.saveConfig(tbl)
+	if type(tbl) ~= "table" then return end
+	local s = Utils.safeEncode(tbl)
+	if s then
+		player:SetAttribute("FlyControl_Config", s)
+	end
+end
+
+function SettingsManager.getPresets()
+	local raw = player:GetAttribute("FlyControl_Presets")
+	if type(raw) ~= "string" then return {} end
+	local tbl = Utils.safeDecode(raw)
+	if type(tbl) ~= "table" then return {} end
+	return tbl
+end
+
+function SettingsManager.savePresets(presets)
+	local s = Utils.safeEncode(presets)
+	if s then player:SetAttribute("FlyControl_Presets", s) end
+end
+
+function SettingsManager.savePreset(name, tbl)
+	if type(name) ~= "string" or name == "" then return false end
+	local presets = SettingsManager.getPresets()
+	presets[name] = tbl
+	SettingsManager.savePresets(presets)
+	return true
+end
+
+function SettingsManager.deletePreset(name)
+	local presets = SettingsManager.getPresets()
+	presets[name] = nil
+	SettingsManager.savePresets(presets)
+end
+
+-- =========================
+-- FlyController
+-- Encapsula ativar/desativar voo e "atravessar"
+-- Usa BodyVelocity/BodyGyro (compatível). Modificar para VectorForce depois é possível.
+-- =========================
+local FlyController = {}
+FlyController._flying = false
+FlyController.bodyVel = nil
+FlyController.bodyGyro = nil
+FlyController.modifiedParts = {} -- [part] = original CanCollide
+FlyController.noCollideConn = nil
+FlyController.collisionGroup = "FlyNoCollide"
+
+function FlyController.ensureCollisionGroup()
 	pcall(function()
-		local existing = PhysicsService:GetCollisionGroups()
-		local found = false
-		for _, g in ipairs(existing) do
-			if g.name == COLLISION_GROUP then found = true break end
+		local groups = PhysicsService:GetCollisionGroups()
+		local exists = false
+		for _,g in ipairs(groups) do
+			if g.name == FlyController.collisionGroup then exists = true break end
 		end
-		if not found then
-			PhysicsService:CreateCollisionGroup(COLLISION_GROUP)
+		if not exists then
+			PhysicsService:CreateCollisionGroup(FlyController.collisionGroup)
 		end
-		-- Make group not collide with Default and itself
-		PhysicsService:CollisionGroupSetCollidable(COLLISION_GROUP, "Default", false)
-		PhysicsService:CollisionGroupSetCollidable(COLLISION_GROUP, COLLISION_GROUP, false)
+		PhysicsService:CollisionGroupSetCollidable(FlyController.collisionGroup, "Default", false)
+		PhysicsService:CollisionGroupSetCollidable(FlyController.collisionGroup, FlyController.collisionGroup, false)
 	end)
 end
 
-local function setCharacterNoCollide(character)
+function FlyController.setCharacterNoCollide(character)
 	if not character then return end
-	ensureCollisionGroup()
-	modifiedParts = {}
-	-- Apply to current parts
-	for _, desc in ipairs(character:GetDescendants()) do
+	FlyController.ensureCollisionGroup()
+	FlyController.modifiedParts = {}
+	-- apply to existing parts
+	for _,desc in ipairs(character:GetDescendants()) do
 		if desc:IsA("BasePart") then
-			modifiedParts[desc] = desc.CanCollide
+			FlyController.modifiedParts[desc] = desc.CanCollide
 			desc.CanCollide = false
-			pcall(function() PhysicsService:SetPartCollisionGroup(desc, COLLISION_GROUP) end)
+			pcall(function() PhysicsService:SetPartCollisionGroup(desc, FlyController.collisionGroup) end)
 		end
 	end
-	-- Watch for parts added later
-	if noCollideConn then
-		noCollideConn:Disconnect()
-		noCollideConn = nil
-	end
-	noCollideConn = character.DescendantAdded:Connect(function(desc)
+	-- watch for new parts
+	if FlyController.noCollideConn then FlyController.noCollideConn:Disconnect() FlyController.noCollideConn = nil end
+	FlyController.noCollideConn = character.DescendantAdded:Connect(function(desc)
 		if desc and desc:IsA("BasePart") then
-			modifiedParts[desc] = desc.CanCollide
+			FlyController.modifiedParts[desc] = desc.CanCollide
 			desc.CanCollide = false
-			pcall(function() PhysicsService:SetPartCollisionGroup(desc, COLLISION_GROUP) end)
+			pcall(function() PhysicsService:SetPartCollisionGroup(desc, FlyController.collisionGroup) end)
 		end
 	end)
-	addConn(noCollideConn)
 end
 
-local function restoreCharacterCollisions()
-	if noCollideConn then
-		noCollideConn:Disconnect()
-		noCollideConn = nil
-	end
-	for part, original in pairs(modifiedParts) do
+function FlyController.restoreCharacterCollisions()
+	if FlyController.noCollideConn then FlyController.noCollideConn:Disconnect() FlyController.noCollideConn = nil end
+	for part,orig in pairs(FlyController.modifiedParts) do
 		if part and part.Parent then
-			part.CanCollide = (original == nil) and true or original
+			part.CanCollide = (orig == nil) and true or orig
 			pcall(function() PhysicsService:SetPartCollisionGroup(part, "Default") end)
 		end
 	end
-	modifiedParts = {}
+	FlyController.modifiedParts = {}
 end
 
--- Utility: save/load settings on Player attribute (session persistence)
-local SETTINGS_ATTR = "FlyControl_Settings"
-local function saveSettings()
-	local ok, json = pcall(function()
-		return HttpService:JSONEncode({
-			flySpeed = FLY_SPEED,
-			jump = jumpPowerValue,
-			walk = walkSpeedValue,
-			sprint = SPRINT_MULT
-		})
-	end)
-	if ok then
-		pcall(function() player:SetAttribute(SETTINGS_ATTR, json) end)
-	end
-end
+function FlyController.enable(params)
+	-- params: speed, sprintMult
+	local root = (player.Character and player.Character:FindFirstChild("HumanoidRootPart")) or (player.CharacterAdded and player.CharacterAdded:Wait() and player.Character:WaitForChild("HumanoidRootPart"))
+	if not root then return end
 
-local function loadSettings()
-	local json = player:GetAttribute(SETTINGS_ATTR)
-	if type(json) == "string" then
-		local ok, tbl = pcall(function() return HttpService:JSONDecode(json) end)
-		if ok and type(tbl) == "table" then
-			FLY_SPEED = tonumber(tbl.flySpeed) or FLY_SPEED
-			jumpPowerValue = tonumber(tbl.jump) or jumpPowerValue
-			walkSpeedValue = tonumber(tbl.walk) or walkSpeedValue
-			SPRINT_MULT = tonumber(tbl.sprint) or SPRINT_MULT
-		end
-	end
-end
-
--- Clean up existing GUI
-local oldGui = playerGui:FindFirstChild("FlyControlUI")
-if oldGui then
-	oldGui:Destroy()
-end
-
--- Create ScreenGui
-local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "FlyControlUI"
-screenGui.ResetOnSpawn = false
-screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-screenGui.Parent = playerGui
-
--- Responsive panel (uses Scale so it adapts)
-local panel = Instance.new("Frame")
-panel.Name = "Panel"
-panel.Size = UDim2.new(0.24, 0, 0.55, 0) -- 24% width, 55% height
-panel.Position = UDim2.new(0.02, 0, 0.22, 0) -- small margin from left/top
-panel.AnchorPoint = Vector2.new(0, 0)
-panel.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-panel.BorderSizePixel = 0
-panel.ClipsDescendants = true
-panel.Parent = screenGui
-
-local panelCorner = Instance.new("UICorner", panel)
-panelCorner.CornerRadius = UDim.new(0, 14)
-
--- Title Bar
-local titleBar = Instance.new("Frame", panel)
-titleBar.Size = UDim2.new(1, 0, 0, 48)
-titleBar.BackgroundColor3 = Color3.fromRGB(248, 248, 252)
-titleBar.BorderSizePixel = 0
-
-local titleCorner = Instance.new("UICorner", titleBar)
-titleCorner.CornerRadius = UDim.new(0, 14)
-
-local titleFill = Instance.new("Frame", titleBar)
-titleFill.Size = UDim2.new(1, 0, 0, 16)
-titleFill.Position = UDim2.new(0, 0, 1, -16)
-titleFill.BackgroundColor3 = titleBar.BackgroundColor3
-titleFill.BorderSizePixel = 0
-
-local title = Instance.new("TextLabel", titleBar)
-title.Size = UDim2.new(1, -96, 1, 0)
-title.Position = UDim2.new(0, 16, 0, 0)
-title.BackgroundTransparency = 1
-title.Text = "Painel de Controle"
-title.Font = Enum.Font.GothamBold
-title.TextSize = 18
-title.TextColor3 = Color3.fromRGB(30, 30, 40)
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.TextScaled = true
-
--- Minimize / close controls
-local minimizeButton = Instance.new("TextButton", titleBar)
-minimizeButton.Size = UDim2.new(0, 36, 0, 36)
-minimizeButton.Position = UDim2.new(1, -46, 0, 6)
-minimizeButton.BackgroundColor3 = Color3.fromRGB(245, 245, 250)
-minimizeButton.BorderSizePixel = 0
-minimizeButton.Text = "—"
-minimizeButton.Font = Enum.Font.GothamBold
-minimizeButton.TextSize = 20
-minimizeButton.TextColor3 = Color3.fromRGB(80, 80, 90)
-minimizeButton.AutoButtonColor = false
-local minimizeCorner = Instance.new("UICorner", minimizeButton)
-minimizeCorner.CornerRadius = UDim.new(0, 8)
-
--- Optional small icon area (for future icons)
-local iconLabel = Instance.new("TextLabel", titleBar)
-iconLabel.Size = UDim2.new(0, 28, 0, 28)
-iconLabel.Position = UDim2.new(1, -94, 0, 10)
-iconLabel.BackgroundTransparency = 1
-iconLabel.Text = "✦"
-iconLabel.Font = Enum.Font.GothamBold
-iconLabel.TextSize = 18
-iconLabel.TextColor3 = Color3.fromRGB(100, 100, 240)
-iconLabel.TextScaled = true
-
--- CONTENT area
-local content = Instance.new("Frame", panel)
-content.Size = UDim2.new(1, -24, 1, -68)
-content.Position = UDim2.new(0, 12, 0, 56)
-content.BackgroundTransparency = 1
-
--- Use UIListLayout for neat stacking
-local listLayout = Instance.new("UIListLayout", content)
-listLayout.SortOrder = Enum.SortOrder.LayoutOrder
-listLayout.Padding = UDim.new(0, 12)
-
-local function createSection(titleText)
-	local frame = Instance.new("Frame")
-	frame.Size = UDim2.new(1, 0, 0, 72)
-	frame.BackgroundTransparency = 1
-	frame.LayoutOrder = 1
-
-	local label = Instance.new("TextLabel", frame)
-	label.Size = UDim2.new(1, 0, 0, 18)
-	label.Position = UDim2.new(0, 0, 0, 0)
-	label.BackgroundTransparency = 1
-	label.Text = titleText
-	label.Font = Enum.Font.GothamSemibold
-	label.TextSize = 14
-	label.TextColor3 = Color3.fromRGB(70, 70, 90)
-	label.TextXAlignment = Enum.TextXAlignment.Left
-	label.TextScaled = true
-
-	return frame
-end
-
--- Toggle fly button
-local toggleButton = Instance.new("TextButton", content)
-toggleButton.Name = "ToggleFly"
-toggleButton.Size = UDim2.new(1, 0, 0, 44)
-toggleButton.BackgroundColor3 = Color3.fromRGB(245, 245, 250)
-toggleButton.BorderSizePixel = 0
-toggleButton.AutoButtonColor = false
-toggleButton.Text = "▶  Ativar Fly  [F]"
-toggleButton.Font = Enum.Font.GothamSemibold
-toggleButton.TextSize = 14
-toggleButton.TextColor3 = Color3.fromRGB(60, 60, 80)
-toggleButton.TextScaled = true
-local toggleCorner = Instance.new("UICorner", toggleButton)
-toggleCorner.CornerRadius = UDim.new(0, 10)
-
--- Small status row
-local statusRow = Instance.new("Frame", content)
-statusRow.Size = UDim2.new(1, 0, 0, 24)
-statusRow.BackgroundTransparency = 1
-local statusDot = Instance.new("Frame", statusRow)
-statusDot.Size = UDim2.new(0, 10, 0, 10)
-statusDot.Position = UDim2.new(0, 0, 0, 7)
-statusDot.BackgroundColor3 = Color3.fromRGB(200, 200, 210)
-statusDot.BorderSizePixel = 0
-local statusDotCorner = Instance.new("UICorner", statusDot)
-statusDotCorner.CornerRadius = UDim.new(1, 0)
-local statusLabel = Instance.new("TextLabel", statusRow)
-statusLabel.Size = UDim2.new(1, -18, 1, 0)
-statusLabel.Position = UDim2.new(0, 18, 0, 0)
-statusLabel.BackgroundTransparency = 1
-statusLabel.Text = "Idle"
-statusLabel.Font = Enum.Font.Gotham
-statusLabel.TextSize = 14
-statusLabel.TextColor3 = Color3.fromRGB(160, 160, 180)
-statusLabel.TextXAlignment = Enum.TextXAlignment.Left
-statusLabel.TextScaled = true
-
--- Slider creation (keeps behavior from original, but text scaled)
-local function createSlider(yOrder, labelText, minValue, maxValue, defaultValue, callback)
-	local frame = Instance.new("Frame")
-	frame.Size = UDim2.new(1, 0, 0, 56)
-	frame.BackgroundTransparency = 1
-	frame.LayoutOrder = yOrder
-
-	local header = Instance.new("Frame", frame)
-	header.Size = UDim2.new(1, 0, 0, 20)
-	header.BackgroundTransparency = 1
-
-	local label = Instance.new("TextLabel", header)
-	label.Size = UDim2.new(0.6, 0, 1, 0)
-	label.BackgroundTransparency = 1
-	label.Text = labelText
-	label.Font = Enum.Font.GothamSemibold
-	label.TextSize = 14
-	label.TextColor3 = Color3.fromRGB(70, 70, 90)
-	label.TextXAlignment = Enum.TextXAlignment.Left
-	label.TextScaled = true
-
-	local numberLabel = Instance.new("TextLabel", header)
-	numberLabel.Size = UDim2.new(0.4, -6, 1, 0)
-	numberLabel.Position = UDim2.new(0.6, 6, 0, 0)
-	numberLabel.BackgroundTransparency = 1
-	numberLabel.Text = tostring(defaultValue)
-	numberLabel.Font = Enum.Font.GothamBold
-	numberLabel.TextSize = 14
-	numberLabel.TextColor3 = Color3.fromRGB(100, 100, 240)
-	numberLabel.TextXAlignment = Enum.TextXAlignment.Right
-	numberLabel.TextScaled = true
-
-	local track = Instance.new("Frame", frame)
-	track.Name = labelText .. "Slider"
-	track.Size = UDim2.new(1, 0, 0, 12)
-	track.Position = UDim2.new(0, 0, 0, 28)
-	track.BackgroundColor3 = Color3.fromRGB(45, 45, 58)
-	track.BorderSizePixel = 0
-	track.Active = true
-	local trackCorner = Instance.new("UICorner", track)
-	trackCorner.CornerRadius = UDim.new(1, 0)
-	local fill = Instance.new("Frame", track)
-	fill.Size = UDim2.new(0, 0, 1, 0)
-	fill.BackgroundColor3 = Color3.fromRGB(100, 100, 240)
-	fill.BorderSizePixel = 0
-	local fillCorner = Instance.new("UICorner", fill)
-	fillCorner.CornerRadius = UDim.new(1, 0)
-	local thumb = Instance.new("TextButton", track)
-	thumb.Size = UDim2.new(0, 20, 0, 20)
-	thumb.AnchorPoint = Vector2.new(0.5, 0.5)
-	thumb.Position = UDim2.new(0, 0, 0.5, 0)
-	thumb.Text = ""
-	thumb.BackgroundColor3 = Color3.fromRGB(255,255,255)
-	thumb.BorderSizePixel = 0
-	thumb.AutoButtonColor = false
-	thumb.ZIndex = 3
-	local thumbCorner = Instance.new("UICorner", thumb)
-	thumbCorner.CornerRadius = UDim.new(1, 0)
-
-	local function setValueFromPercent(percent)
-		percent = math.clamp(percent, 0, 1)
-		local value = math.floor(minValue + percent * (maxValue - minValue) + 0.5)
-		numberLabel.Text = tostring(value)
-		local trackWidth = track.AbsoluteSize.X
-		local thumbX = percent * trackWidth
-		thumb.Position = UDim2.new(0, thumbX, 0.5, 0)
-		fill.Size = UDim2.new(0, thumbX, 1, 0)
-		callback(value)
-		saveSettings()
-	end
-
-	local function updateFromInput(input)
-		local trackWidth = track.AbsoluteSize.X
-		if trackWidth <= 0 then return end
-		local percent = (input.Position.X - track.AbsolutePosition.X) / trackWidth
-		setValueFromPercent(percent)
-	end
-
-	local function beginDrag(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-			sliderDragging = track
-			updateFromInput(input)
-		end
-	end
-
-	track.InputBegan:Connect(beginDrag)
-	thumb.InputBegan:Connect(beginDrag)
-
-	-- initialize from defaultValue
-	task.defer(function()
-		local percent = (defaultValue - minValue) / math.max(1, (maxValue - minValue))
-		setValueFromPercent(percent)
-	end)
-
-	return frame
-end
-
--- Create sliders
-local flySlider = createSlider(2, "Fly Speed", SPEED_MIN, SPEED_MAX, FLY_SPEED, function(v) FLY_SPEED = v end)
-flySlider.Parent = content
-local jumpSlider = createSlider(3, "JumpPower", JUMP_MIN, JUMP_MAX, jumpPowerValue, function(v) jumpPowerValue = v; 
-	local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
-	if humanoid then humanoid.UseJumpPower = true; humanoid.JumpPower = jumpPowerValue end
-end)
-jumpSlider.Parent = content
-local walkSlider = createSlider(4, "WalkSpeed", WALK_MIN, WALK_MAX, walkSpeedValue, function(v) walkSpeedValue = v;
-	local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
-	if humanoid then humanoid.WalkSpeed = walkSpeedValue end
-end)
-walkSlider.Parent = content
-
--- Status initialization
-local function setUIFlying(state)
-	local tweenInfo = TweenInfo.new(0.18, Enum.EasingStyle.Quad)
-	if state then
-		TweenService:Create(toggleButton, tweenInfo, {BackgroundColor3 = Color3.fromRGB(100,100,240), TextColor3 = Color3.fromRGB(255,255,255)}):Play()
-		TweenService:Create(statusDot, tweenInfo, {BackgroundColor3 = Color3.fromRGB(100,220,130)}):Play()
-		toggleButton.Text = "■  Desativar Fly  [F]"
-		statusLabel.Text = "Flying"
-		statusLabel.TextColor3 = Color3.fromRGB(80,180,110)
-	else
-		TweenService:Create(toggleButton, tweenInfo, {BackgroundColor3 = Color3.fromRGB(245,245,250), TextColor3 = Color3.fromRGB(60,60,80)}):Play()
-		TweenService:Create(statusDot, tweenInfo, {BackgroundColor3 = Color3.fromRGB(200,200,210)}):Play()
-		toggleButton.Text = "▶  Ativar Fly  [F]"
-		statusLabel.Text = "Idle"
-		statusLabel.TextColor3 = Color3.fromRGB(160,160,180)
-	end
-end
-
-local function getHumanoid()
-	local character = player.Character
-	return character and character:FindFirstChildOfClass("Humanoid")
-end
-
-local function applyCharacterValues()
-	local humanoid = getHumanoid()
-	if humanoid then
-		humanoid.UseJumpPower = true
-		humanoid.JumpPower = jumpPowerValue
-		humanoid.WalkSpeed = walkSpeedValue
-	end
-end
-
--- Flight enable/disable (keeps BodyVelocity/BodyGyro)
-local function getRootPart()
-	local character = player.Character or player.CharacterAdded:Wait()
-	return character:WaitForChild("HumanoidRootPart")
-end
-
-local function enableFly()
-	local root = getRootPart()
-	-- remove previous
+	-- clean existing
 	if root:FindFirstChild("FlyVelocity") then root.FlyVelocity:Destroy() end
 	if root:FindFirstChild("FlyGyro") then root.FlyGyro:Destroy() end
 
-	bodyVel = Instance.new("BodyVelocity")
+	local bodyVel = Instance.new("BodyVelocity")
 	bodyVel.Name = "FlyVelocity"
-	bodyVel.Velocity = Vector3.new(0,0,0)
 	bodyVel.MaxForce = Vector3.new(1e5,1e5,1e5)
-	bodyVel.P = 1250
+	bodyVel.Velocity = Vector3.new(0,0,0)
 	bodyVel.Parent = root
+	bodyVel.P = 1250
 
-	bodyGyro = Instance.new("BodyGyro")
+	local bodyGyro = Instance.new("BodyGyro")
 	bodyGyro.Name = "FlyGyro"
 	bodyGyro.MaxTorque = Vector3.new(1e5,1e5,1e5)
 	bodyGyro.D = 50
 	bodyGyro.CFrame = root.CFrame
 	bodyGyro.Parent = root
 
-	local humanoid = getHumanoid()
+	FlyController.bodyVel = bodyVel
+	FlyController.bodyGyro = bodyGyro
+
+	local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
 	if humanoid then humanoid.PlatformStand = true end
 
-	-- disable collisions
+	-- collisions off
 	local character = player.Character
-	if character then setCharacterNoCollide(character) end
+	if character then FlyController.setCharacterNoCollide(character) end
 
-	flying = true
-	setUIFlying(true)
+	FlyController._flying = true
 end
 
-local function disableFly()
-	if bodyVel then bodyVel:Destroy(); bodyVel = nil end
-	if bodyGyro then bodyGyro:Destroy(); bodyGyro = nil end
+function FlyController.disable()
+	if FlyController.bodyVel then FlyController.bodyVel:Destroy(); FlyController.bodyVel = nil end
+	if FlyController.bodyGyro then FlyController.bodyGyro:Destroy(); FlyController.bodyGyro = nil end
 
-	local humanoid = getHumanoid()
+	local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
 	if humanoid then humanoid.PlatformStand = false end
 
-	restoreCharacterCollisions()
-
-	flying = false
-	setUIFlying(false)
+	FlyController.restoreCharacterCollisions()
+	FlyController._flying = false
 end
 
-local function toggleFly()
-	if flying then disableFly() else enableFly() end
+function FlyController.isFlying()
+	return FlyController._flying
 end
 
--- Input direction function
-local function getInputDirection()
-	local direction = Vector3.zero
-	if UserInputService:IsKeyDown(Enum.KeyCode.W) or UserInputService:IsKeyDown(Enum.KeyCode.Up) then direction += Vector3.new(0,0,-1) end
-	if UserInputService:IsKeyDown(Enum.KeyCode.S) or UserInputService:IsKeyDown(Enum.KeyCode.Down) then direction += Vector3.new(0,0,1) end
-	if UserInputService:IsKeyDown(Enum.KeyCode.A) or UserInputService:IsKeyDown(Enum.KeyCode.Left) then direction += Vector3.new(-1,0,0) end
-	if UserInputService:IsKeyDown(Enum.KeyCode.D) or UserInputService:IsKeyDown(Enum.KeyCode.Right) then direction += Vector3.new(1,0,0) end
-	if UserInputService:IsKeyDown(Enum.KeyCode.Space) then direction += Vector3.new(0,1,0) end
-	if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.RightControl) then direction += Vector3.new(0,-1,0) end
-	return direction
-end
+-- =========================
+-- InputManager
+-- Gerencia keybind gravável e modo Toggle/Hold
+-- =========================
+local InputManager = {}
+InputManager.currentKey = DEFAULTS.ToggleKey
+InputManager.inputMode = DEFAULTS.InputMode -- "Toggle" or "Hold"
+InputManager._recording = false
+InputManager._recordConn = nil
 
--- Toggle bindings
-toggleButton.Activated:Connect(toggleFly)
-addConn(toggleButton.Activated)
-
-UserInputService.InputBegan:Connect(function(input, processed)
-	if not processed and input.KeyCode == TOGGLE_KEY then toggleFly() end
-end)
-addConn(UserInputService.InputBegan)
-
--- Heartbeat movement
-local heartbeatConn
-heartbeatConn = RunService.Heartbeat:Connect(function()
-	if not flying or not bodyVel or not bodyGyro then return end
-	local root = getRootPart()
-	local camera = workspace.CurrentCamera
-	local inputDirection = getInputDirection()
-	if not camera then return end
-	local sprinting = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
-	local speed = sprinting and FLY_SPEED * SPRINT_MULT or FLY_SPEED
-
-	if inputDirection.Magnitude > 0 then
-		local worldDirection = camera.CFrame:VectorToWorldSpace(inputDirection).Unit
-		bodyVel.Velocity = worldDirection * speed
-		local lookDirection = Vector3.new(worldDirection.X, 0, worldDirection.Z)
-		if lookDirection.Magnitude > 0.01 then
-			bodyGyro.CFrame = CFrame.lookAt(root.Position, root.Position + lookDirection)
-		end
-	else
-		bodyVel.Velocity = bodyVel.Velocity * 0.85
+function InputManager.loadFromConfig(cfg)
+	if not cfg then return end
+	if cfg.ToggleKey and typeof(cfg.ToggleKey) == "EnumItem" then
+		InputManager.currentKey = cfg.ToggleKey
+	elseif cfg.ToggleKey and type(cfg.ToggleKey) == "string" then
+		-- try convert string to Enum.KeyCode
+		local success, enum = pcall(function() return Enum.KeyCode[cfg.ToggleKey] end)
+		if success and enum then InputManager.currentKey = enum end
 	end
-end)
-addConn(heartbeatConn)
+	InputManager.inputMode = cfg.InputMode or InputManager.inputMode
+end
 
--- Character respawn handling
-local charAddedConn
-charAddedConn = player.CharacterAdded:Connect(function()
-	-- reset state
-	flying = false
-	bodyVel = nil
-	bodyGyro = nil
-	restoreCharacterCollisions()
-	task.wait(0.5)
-	applyCharacterValues()
-	setUIFlying(false)
-end)
-addConn(charAddedConn)
+function InputManager.saveToConfig(cfg)
+	if not cfg then return end
+	cfg.ToggleKey = tostring(InputManager.currentKey.Name)
+	cfg.InputMode = InputManager.inputMode
+	return cfg
+end
 
--- Slider dragging input handling
-local inputChangedConn = UserInputService.InputChanged:Connect(function(input)
-	if not sliderDragging then return end
-	if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-		local track = sliderDragging
-		local trackWidth = track.AbsoluteSize.X
-		if trackWidth > 0 then
+-- Start recording next key pressed (for keybind UI)
+function InputManager.startRecord(callback)
+	if InputManager._recording then return end
+	InputManager._recording = true
+	-- temporary bind to get next keyboard input
+	InputManager._recordConn = UserInputService.InputBegan:Connect(function(input, gp)
+		if gp then return end
+		if input.UserInputType == Enum.UserInputType.Keyboard then
+			local key = input.KeyCode
+			InputManager.currentKey = key
+			InputManager._recording = false
+			if InputManager._recordConn then InputManager._recordConn:Disconnect(); InputManager._recordConn = nil end
+			if callback then callback(key) end
+		end
+	end)
+end
+
+-- =========================
+-- UIFactory: cria a GUI e retorna handles
+-- =========================
+local UIFactory = {}
+function UIFactory.create()
+	-- clean old
+	local old = playerGui:FindFirstChild("FlyControlUI")
+	if old then old:Destroy() end
+
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.Name = "FlyControlUI"
+	screenGui.ResetOnSpawn = false
+	screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	screenGui.Parent = playerGui
+
+	-- main panel (scale-based responsive)
+	local panel = Instance.new("Frame", screenGui)
+	panel.Name = "Panel"
+	panel.Size = UDim2.new(0.24, 0, 0.55, 0)
+	panel.Position = UDim2.new(0.02, 0, 0.22, 0)
+	panel.BackgroundColor3 = Color3.fromRGB(255,255,255)
+	panel.BorderSizePixel = 0
+	panel.ClipsDescendants = true
+	local panelCorner = Instance.new("UICorner", panel)
+	panelCorner.CornerRadius = UDim.new(0,14)
+
+	-- titlebar
+	local titleBar = Instance.new("Frame", panel)
+	titleBar.Name = "TitleBar"
+	titleBar.Size = UDim2.new(1,0,0,48)
+	titleBar.BackgroundColor3 = Color3.fromRGB(248,248,252)
+	titleBar.BorderSizePixel = 0
+	local titleCorner = Instance.new("UICorner", titleBar)
+	titleCorner.CornerRadius = UDim.new(0,14)
+
+	local titleText = Instance.new("TextLabel", titleBar)
+	titleText.Size = UDim2.new(1, -120, 1, 0)
+	titleText.Position = UDim2.new(0, 16, 0, 0)
+	titleText.BackgroundTransparency = 1
+	titleText.Text = "Painel de Controle"
+	titleText.Font = Enum.Font.GothamBold
+	titleText.TextSize = 18
+	titleText.TextColor3 = Color3.fromRGB(30,30,40)
+	titleText.TextXAlignment = Enum.TextXAlignment.Left
+	titleText.TextScaled = true
+
+	-- minimize button
+	local minBtn = Instance.new("TextButton", titleBar)
+	minBtn.Name = "Minimize"
+	minBtn.Size = UDim2.new(0,36,0,36)
+	minBtn.Position = UDim2.new(1, -46, 0, 6)
+	minBtn.BackgroundColor3 = Color3.fromRGB(245,245,250)
+	minBtn.BorderSizePixel = 0
+	minBtn.Text = "—"
+	minBtn.Font = Enum.Font.GothamBold
+	minBtn.TextSize = 20
+	minBtn.TextColor3 = Color3.fromRGB(80,80,90)
+	minBtn.AutoButtonColor = false
+	local minCorner = Instance.new("UICorner", minBtn)
+	minCorner.CornerRadius = UDim.new(0,8)
+
+	-- content as ScrollingFrame
+	local content = Instance.new("ScrollingFrame", panel)
+	content.Name = "Content"
+	content.Size = UDim2.new(1, -24, 1, -68)
+	content.Position = UDim2.new(0, 12, 0, 56)
+	content.BackgroundTransparency = 1
+	content.ScrollBarThickness = 8
+	content.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	content.ScrollBarImageColor3 = Color3.fromRGB(150,150,200)
+	content.VerticalScrollBarInset = Enum.ScrollBarInset.ScrollBar
+
+	local listLayout = Instance.new("UIListLayout", content)
+	listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	listLayout.Padding = UDim.new(0,12)
+	local padding = Instance.new("UIPadding", content)
+	padding.PaddingTop = UDim.new(0,6)
+	padding.PaddingBottom = UDim.new(0,6)
+	padding.PaddingLeft = UDim.new(0,6)
+	padding.PaddingRight = UDim.new(0,6)
+
+	-- Scroll arrows
+	local upArrow = Instance.new("TextButton", panel)
+	upArrow.Name = "UpArrow"
+	upArrow.Size = UDim2.new(0,32,0,32)
+	upArrow.Position = UDim2.new(0.5, -16, 0, 8)
+	upArrow.BackgroundColor3 = Color3.fromRGB(240,240,245)
+	upArrow.Text = "▲"
+	upArrow.Font = Enum.Font.GothamBold
+	upArrow.TextSize = 16
+	upArrow.Visible = false
+	local upCorner = Instance.new("UICorner", upArrow)
+	upCorner.CornerRadius = UDim.new(0,8)
+
+	local downArrow = Instance.new("TextButton", panel)
+	downArrow.Name = "DownArrow"
+	downArrow.Size = UDim2.new(0,32,0,32)
+	downArrow.Position = UDim2.new(0.5, -16, 1, -40)
+	downArrow.BackgroundColor3 = Color3.fromRGB(240,240,245)
+	downArrow.Text = "▼"
+	downArrow.Font = Enum.Font.GothamBold
+	downArrow.TextSize = 16
+	downArrow.Visible = false
+	local downCorner = Instance.new("UICorner", downArrow)
+	downCorner.CornerRadius = UDim.new(0,8)
+
+	-- Toggle button
+	local toggleBtn = Instance.new("TextButton", content)
+	toggleBtn.Name = "ToggleFly"
+	toggleBtn.Size = UDim2.new(1,0,0,44)
+	toggleBtn.BackgroundColor3 = Color3.fromRGB(245,245,250)
+	toggleBtn.BorderSizePixel = 0
+	toggleBtn.AutoButtonColor = false
+	toggleBtn.Text = "▶  Ativar Fly  [F]"
+	toggleBtn.Font = Enum.Font.GothamSemibold
+	toggleBtn.TextSize = 14
+	toggleBtn.TextColor3 = Color3.fromRGB(60,60,80)
+	toggleBtn.TextScaled = true
+	local toggleCorner = Instance.new("UICorner", toggleBtn)
+	toggleCorner.CornerRadius = UDim.new(0,10)
+	toggleBtn.LayoutOrder = 1
+
+	-- status row
+	local statusRow = Instance.new("Frame", content)
+	statusRow.Size = UDim2.new(1,0,0,24)
+	statusRow.BackgroundTransparency = 1
+	statusRow.LayoutOrder = 2
+	local statusDot = Instance.new("Frame", statusRow)
+	statusDot.Size = UDim2.new(0,10,0,10); statusDot.Position = UDim2.new(0,0,0,7)
+	statusDot.BackgroundColor3 = Color3.fromRGB(200,200,210)
+	statusDot.BorderSizePixel = 0
+	local sdCorner = Instance.new("UICorner", statusDot); sdCorner.CornerRadius = UDim.new(1,0)
+	local statusLabel = Instance.new("TextLabel", statusRow)
+	statusLabel.Size = UDim2.new(1,-18,1,0); statusLabel.Position = UDim2.new(0,18,0,0)
+	statusLabel.BackgroundTransparency = 1; statusLabel.Text = "Idle"
+	statusLabel.Font = Enum.Font.Gotham; statusLabel.TextSize = 14; statusLabel.TextColor3 = Color3.fromRGB(160,160,180); statusLabel.TextScaled = true
+
+	-- Helper to create sliders (returns frame)
+	local function createSlider(labelText, minVal, maxVal, default, layoutOrder)
+		local frame = Instance.new("Frame")
+		frame.Size = UDim2.new(1,0,0,64)
+		frame.BackgroundTransparency = 1
+		frame.LayoutOrder = layoutOrder
+
+		local header = Instance.new("Frame", frame)
+		header.Size = UDim2.new(1,0,0,20)
+		header.BackgroundTransparency = 1
+
+		local label = Instance.new("TextLabel", header)
+		label.Size = UDim2.new(0.6,0,1,0); label.BackgroundTransparency = 1
+		label.Text = labelText; label.Font = Enum.Font.GothamSemibold; label.TextSize = 14; label.TextColor3 = Color3.fromRGB(70,70,90); label.TextScaled = true
+
+		local numberLabel = Instance.new("TextLabel", header)
+		numberLabel.Size = UDim2.new(0.4,-6,1,0); numberLabel.Position = UDim2.new(0.6,6,0,0)
+		numberLabel.BackgroundTransparency = 1; numberLabel.Text = tostring(default)
+		numberLabel.Font = Enum.Font.GothamBold; numberLabel.TextSize = 14; numberLabel.TextColor3 = Color3.fromRGB(100,100,240); numberLabel.TextScaled = true
+		numberLabel.TextXAlignment = Enum.TextXAlignment.Right
+
+		local track = Instance.new("Frame", frame)
+		track.Name = labelText .. "Slider"
+		track.Size = UDim2.new(1,0,0,12)
+		track.Position = UDim2.new(0,0,0,32)
+		track.BackgroundColor3 = Color3.fromRGB(45,45,58); track.BorderSizePixel = 0
+		track.Active = true
+		local tc = Instance.new("UICorner", track); tc.CornerRadius = UDim.new(1,0)
+		local fill = Instance.new("Frame", track); fill.Size = UDim2.new(0,0,1,0); fill.BackgroundColor3 = Color3.fromRGB(100,100,240); fill.BorderSizePixel = 0
+		local fc = Instance.new("UICorner", fill); fc.CornerRadius = UDim.new(1,0)
+		local thumb = Instance.new("TextButton", track); thumb.Size = UDim2.new(0,20,0,20); thumb.AnchorPoint = Vector2.new(0.5,0.5)
+		thumb.Position = UDim2.new(0, 0, 0.5, 0); thumb.Text = ""; thumb.BackgroundColor3 = Color3.fromRGB(255,255,255); thumb.BorderSizePixel = 0; thumb.AutoButtonColor = false
+		local thc = Instance.new("UICorner", thumb); thc.CornerRadius = UDim.new(1,0)
+
+		-- set functions
+		local function setPercent(p)
+			p = Utils.clamp(p,0,1)
+			local value = math.floor(minVal + p * (maxVal - minVal) + 0.5)
+			numberLabel.Text = tostring(value)
+			local w = track.AbsoluteSize.X
+			local x = p * w
+			thumb.Position = UDim2.new(0, x, 0.5, 0)
+			fill.Size = UDim2.new(0, x, 1, 0)
+			return value
+		end
+
+		-- handle dragging
+		track.InputBegan:Connect(function(inp)
+			if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+				sliderDragging = track
+				local pos = inp.Position
+				local w = track.AbsoluteSize.X
+				if w > 0 then
+					local percent = (pos.X - track.AbsolutePosition.X) / w
+					local val = setPercent(percent)
+					return val
+				end
+			end
+		end)
+		thumb.InputBegan:Connect(function(inp)
+			if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+				sliderDragging = track
+			end
+		end)
+
+		-- initialize
+		task.defer(function()
+			local p = (default - minVal) / math.max(1, (maxVal - minVal))
+			setPercent(p)
+		end)
+
+		-- expose updateFromValue for external callback
+		frame.SetValueFromPercent = function(percent)
+			return setPercent(percent)
+		end
+
+		frame.GetTrack = function() return track end
+		frame.GetNumberLabel = function() return numberLabel end
+
+		return frame
+	end
+
+	-- create sliders
+	local flySlider = createSlider("Fly Speed", LIMITS.Speed.min, LIMITS.Speed.max, DEFAULTS.FlySpeed, 3)
+	flySlider.LayoutOrder = 3; flySlider.Parent = content
+	local jumpSlider = createSlider("JumpPower", LIMITS.Jump.min, LIMITS.Jump.max, DEFAULTS.JumpPower, 4)
+	jumpSlider.LayoutOrder = 4; jumpSlider.Parent = content
+	local walkSlider = createSlider("WalkSpeed", LIMITS.Walk.min, LIMITS.Walk.max, DEFAULTS.WalkSpeed, 5)
+	walkSlider.LayoutOrder = 5; walkSlider.Parent = content
+
+	-- Keybind section (record key & mode)
+	local kbFrame = Instance.new("Frame", content)
+	kbFrame.Size = UDim2.new(1,0,0,48); kbFrame.LayoutOrder = 6; kbFrame.BackgroundTransparency = 1
+	local kbLabel = Instance.new("TextLabel", kbFrame)
+	kbLabel.Size = UDim2.new(0.5,0,1,0); kbLabel.BackgroundTransparency = 1; kbLabel.Text = "Keybind:"; kbLabel.Font = Enum.Font.GothamSemibold; kbLabel.TextScaled = true
+	local keyBtn = Instance.new("TextButton", kbFrame)
+	keyBtn.Size = UDim2.new(0.4, -6, 0.6, 0); keyBtn.Position = UDim2.new(0.5,6,0.2,0)
+	keyBtn.Text = tostring(DEFAULTS.ToggleKey.Name); keyBtn.AutoButtonColor = false; keyBtn.Font = Enum.Font.GothamBold; keyBtn.TextScaled = true
+	local modeToggle = Instance.new("TextButton", kbFrame)
+	modeToggle.Size = UDim2.new(0.12,0,0.6,0); modeToggle.Position = UDim2.new(0.92, -36, 0.2, 0)
+	modeToggle.Text = "T" -- T = Toggle, H = Hold
+	modeToggle.AutoButtonColor = false; modeToggle.Font = Enum.Font.GothamBold; modeToggle.TextScaled = true
+
+	-- Presets section (save/load)
+	local presetFrame = Instance.new("Frame", content)
+	presetFrame.Size = UDim2.new(1,0,0,140); presetFrame.LayoutOrder = 7; presetFrame.BackgroundTransparency = 1
+
+	local presetLabel = Instance.new("TextLabel", presetFrame)
+	presetLabel.Size = UDim2.new(1,0,0,20); presetLabel.BackgroundTransparency = 1; presetLabel.Text = "Presets"; presetLabel.Font = Enum.Font.GothamSemibold; presetLabel.TextScaled = true
+
+	local presetInput = Instance.new("TextBox", presetFrame)
+	presetInput.Size = UDim2.new(0.6, -6, 0, 28); presetInput.Position = UDim2.new(0, 6, 0, 30)
+	presetInput.PlaceholderText = "Nome do preset"; presetInput.Text = ""; presetInput.Font = Enum.Font.Gotham; presetInput.TextScaled = true
+
+	local savePresetBtn = Instance.new("TextButton", presetFrame)
+	savePresetBtn.Size = UDim2.new(0.2, -6, 0, 28); savePresetBtn.Position = UDim2.new(0.62, 6, 0, 30)
+	savePresetBtn.Text = "Salvar"; savePresetBtn.AutoButtonColor = false; savePresetBtn.Font = Enum.Font.GothamBold; savePresetBtn.TextScaled = true
+
+	local presetList = Instance.new("Frame", presetFrame)
+	presetList.Size = UDim2.new(1, -12, 0, 68); presetList.Position = UDim2.new(0, 6, 0, 66); presetList.BackgroundTransparency = 1
+	local presetLayout = Instance.new("UIListLayout", presetList)
+	presetLayout.FillDirection = Enum.FillDirection.Horizontal
+	presetLayout.HorizontalAlignment = Enum.HorizontalAlignment.Left
+	presetLayout.Padding = UDim.new(0,8)
+
+	-- Tooltip (shared)
+	local tooltip = Instance.new("TextLabel", screenGui)
+	tooltip.Size = UDim2.new(0,200,0,36)
+	tooltip.BackgroundColor3 = Color3.fromRGB(30,30,30)
+	tooltip.TextColor3 = Color3.fromRGB(255,255,255)
+	tooltip.TextScaled = true
+	tooltip.Visible = false
+	tooltip.AnchorPoint = Vector2.new(0.5, 1)
+	tooltip.ZIndex = 1000
+	local tipCorner = Instance.new("UICorner", tooltip)
+	tipCorner.CornerRadius = UDim.new(0,8)
+	tooltip.BackgroundTransparency = 0.15
+
+	-- Bubble (minimized)
+	local bubble = Instance.new("TextButton", screenGui)
+	bubble.Name = "MinimizedBubble"
+	bubble.Size = UDim2.new(0, 64, 0, 64)
+	bubble.BackgroundColor3 = Color3.fromRGB(100,100,240)
+	bubble.Text = "⦿"
+	bubble.Font = Enum.Font.GothamBold
+	bubble.TextSize = 32
+	bubble.TextColor3 = Color3.fromRGB(255,255,255)
+	bubble.BorderSizePixel = 0
+	bubble.Visible = false
+	local bubbleCorner = Instance.new("UICorner", bubble)
+	bubbleCorner.CornerRadius = UDim.new(1,0)
+
+	-- return handles
+	return {
+		ScreenGui = screenGui,
+		Panel = panel,
+		TitleBar = titleBar,
+		MinimizeBtn = minBtn,
+		Content = content,
+		ListLayout = listLayout,
+		UpArrow = upArrow,
+		DownArrow = downArrow,
+		ToggleBtn = toggleBtn,
+		StatusDot = statusDot,
+		StatusLabel = statusLabel,
+		FlySlider = flySlider,
+		JumpSlider = jumpSlider,
+		WalkSlider = walkSlider,
+		KeyBtn = keyBtn,
+		ModeToggle = modeToggle,
+		PresetInput = presetInput,
+		SavePresetBtn = savePresetBtn,
+		PresetList = presetList,
+		Tooltip = tooltip,
+		Bubble = bubble
+	}
+end
+
+-- =========================
+-- Controller: orquestra tudo
+-- =========================
+local Controller = {}
+function Controller:init()
+	-- load config
+	self.config = SettingsManager.loadConfig()
+	InputManager.loadFromConfig(self.config)
+
+	-- create UI
+	self.ui = UIFactory.create()
+	self.screenGui = self.ui.ScreenGui
+	self.panel = self.ui.Panel
+	self.content = self.ui.Content
+	self.flySlider = self.ui.FlySlider
+	self.jumpSlider = self.ui.JumpSlider
+	self.walkSlider = self.ui.WalkSlider
+	self.toggleBtn = self.ui.ToggleBtn
+	self.statusDot = self.ui.StatusDot
+	self.statusLabel = self.ui.StatusLabel
+	self.minBtn = self.ui.MinimizeBtn
+	self.upArrow = self.ui.UpArrow
+	self.downArrow = self.ui.DownArrow
+	self.keyBtn = self.ui.KeyBtn
+	self.modeToggle = self.ui.ModeToggle
+	self.presetInput = self.ui.PresetInput
+	self.savePresetBtn = self.ui.SavePresetBtn
+	self.presetList = self.ui.PresetList
+	self.tooltip = self.ui.Tooltip
+	self.bubble = self.ui.Bubble
+
+	-- state
+	self.flying = false
+	self.connections = {}
+	self.sliderDragging = nil
+
+	-- apply loaded config to sliders & UI
+	self:applyConfigToUI()
+
+	-- connect events
+	self:connectUI()
+	-- update arrows first time (defer for layout)
+	task.defer(function() self:updateScrollArrows() end)
+	-- load presets into UI
+	self:refreshPresetButtons()
+end
+
+function Controller:applyConfigToUI()
+	-- set slider initial values from config (or defaults)
+	local cfg = self.config
+	-- fly slider percent
+	local pFly = (cfg.FlySpeed or DEFAULTS.FlySpeed - LIMITS.Speed.min) / math.max(1, LIMITS.Speed.max - LIMITS.Speed.min)
+	self.flySlider.SetValueFromPercent((cfg.FlySpeed or DEFAULTS.FlySpeed - LIMITS.Speed.min) / math.max(1, LIMITS.Speed.max - LIMITS.Speed.min))
+	-- set number labels directly as fallback
+	local function setLabelFromSlider(slider, val)
+		local lbl = slider:GetNumberLabel()
+		if lbl then lbl.Text = tostring(val) end
+	end
+	-- update sliders with saved values
+	if cfg.FlySpeed then
+		local p = (cfg.FlySpeed - LIMITS.Speed.min)/math.max(1, LIMITS.Speed.max - LIMITS.Speed.min)
+		self.flySlider.SetValueFromPercent(p)
+	end
+	if cfg.JumpPower then
+		local p = (cfg.JumpPower - LIMITS.Jump.min)/math.max(1, LIMITS.Jump.max - LIMITS.Jump.min)
+		self.jumpSlider.SetValueFromPercent(p)
+	end
+	if cfg.WalkSpeed then
+		local p = (cfg.WalkSpeed - LIMITS.Walk.min)/math.max(1, LIMITS.Walk.max - LIMITS.Walk.min)
+		self.walkSlider.SetValueFromPercent(p)
+	end
+
+	-- key button
+	self.keyBtn.Text = (self.config.ToggleKey and tostring(self.config.ToggleKey) or tostring(InputManager.currentKey.Name))
+	-- mode toggle text
+	self.modeToggle.Text = (self.config.InputMode == "Hold") and "H" or "T"
+end
+
+function Controller:connectUI()
+	-- store conns for cleanup
+	local function watch(conn) table.insert(self.connections, conn) end
+
+	-- Hover tooltips helper
+	local function attachTooltip(inst, text)
+		if not inst then return end
+		inst.MouseEnter:Connect(function()
+			local pos = UserInputService:GetMouseLocation()
+			self.tooltip.Text = text
+			self.tooltip.Position = UDim2.new(0, pos.X, 0, pos.Y - 8)
+			self.tooltip.Visible = true
+		end)
+		inst.MouseLeave:Connect(function() self.tooltip.Visible = false end)
+	end
+
+	attachTooltip(self.toggleBtn, "Ativa/Desativa o fly\nAtalho: " .. tostring(InputManager.currentKey.Name))
+	attachTooltip(self.minBtn, "Minimizar")
+	attachTooltip(self.bubble, "Restaurar painel")
+	attachTooltip(self.savePresetBtn, "Salvar preset atual")
+
+	-- toggle fly button
+	local function setUIFlying(state)
+		local tweenInfo = TweenInfo.new(0.18, Enum.EasingStyle.Quad)
+		if state then
+			Utils.tween(self.toggleBtn, {BackgroundColor3 = Color3.fromRGB(100,100,240), TextColor3 = Color3.fromRGB(255,255,255)}, 0.18)
+			Utils.tween(self.statusDot, {BackgroundColor3 = Color3.fromRGB(100,220,130)}, 0.18)
+			self.toggleBtn.Text = "■  Desativar Fly  [" .. tostring(InputManager.currentKey.Name) .. "]"
+			self.statusLabel.Text = "Flying"
+			self.statusLabel.TextColor3 = Color3.fromRGB(80,180,110)
+		else
+			Utils.tween(self.toggleBtn, {BackgroundColor3 = Color3.fromRGB(245,245,250), TextColor3 = Color3.fromRGB(60,60,80)}, 0.18)
+			Utils.tween(self.statusDot, {BackgroundColor3 = Color3.fromRGB(200,200,210)}, 0.18)
+			self.toggleBtn.Text = "▶  Ativar Fly  [" .. tostring(InputManager.currentKey.Name) .. "]"
+			self.statusLabel.Text = "Idle"
+			self.statusLabel.TextColor3 = Color3.fromRGB(160,160,180)
+		end
+	end
+
+	-- internal heartbeat to update movement when flying
+	local hbConn = RunService.Heartbeat:Connect(function()
+		if not FlyController.isFlying() or not FlyController.bodyVel then return end
+		local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+		if not root then return end
+		local cam = workspace.CurrentCamera
+		if not cam then return end
+		-- build input direction
+		local dir = Vector3.new(0,0,0)
+		if UserInputService:IsKeyDown(Enum.KeyCode.W) or UserInputService:IsKeyDown(Enum.KeyCode.Up) then dir += Vector3.new(0,0,-1) end
+		if UserInputService:IsKeyDown(Enum.KeyCode.S) or UserInputService:IsKeyDown(Enum.KeyCode.Down) then dir += Vector3.new(0,0,1) end
+		if UserInputService:IsKeyDown(Enum.KeyCode.A) or UserInputService:IsKeyDown(Enum.KeyCode.Left) then dir += Vector3.new(-1,0,0) end
+		if UserInputService:IsKeyDown(Enum.KeyCode.D) or UserInputService:IsKeyDown(Enum.KeyCode.Right) then dir += Vector3.new(1,0,0) end
+		if UserInputService:IsKeyDown(Enum.KeyCode.Space) then dir += Vector3.new(0,1,0) end
+		if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.RightControl) then dir += Vector3.new(0,-1,0) end
+
+		local sprinting = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
+		local sp = (self.config.FlySpeed or DEFAULTS.FlySpeed)
+		local speed = sprinting and sp * (self.config.SprintMult or DEFAULTS.SprintMult) or sp
+
+		if dir.Magnitude > 0 then
+			local world = cam.CFrame:VectorToWorldSpace(dir).Unit
+			FlyController.bodyVel.Velocity = world * speed
+			local lookDir = Vector3.new(world.X, 0, world.Z)
+			if lookDir.Magnitude > 0.01 then
+				FlyController.bodyGyro.CFrame = CFrame.lookAt(root.Position, root.Position + lookDir)
+			end
+		else
+			FlyController.bodyVel.Velocity = FlyController.bodyVel.Velocity * 0.85
+		end
+	end)
+	watch(hbConn)
+
+	-- toggle button action
+	self.toggleBtn.Activated:Connect(function()
+		if FlyController.isFlying() then
+			FlyController.disable()
+			setUIFlying(false)
+		else
+			FlyController.enable()
+			setUIFlying(true)
+		end
+	end)
+
+	-- key input handling (Toggle vs Hold)
+	local kbConn = UserInputService.InputBegan:Connect(function(input, processed)
+		if processed then return end
+		if input.UserInputType == Enum.UserInputType.Keyboard then
+			if input.KeyCode == InputManager.currentKey then
+				-- depending on mode
+				if InputManager.inputMode == "Toggle" then
+					if FlyController.isFlying() then FlyController.disable(); setUIFlying(false)
+					else FlyController.enable(); setUIFlying(true) end
+				else -- Hold
+					if not FlyController.isFlying() then FlyController.enable(); setUIFlying(true) end
+				end
+			end
+		end
+	end)
+	watch(kbConn)
+
+	local kbUpConn = UserInputService.InputEnded:Connect(function(input, processed)
+		if processed then return end
+		if input.UserInputType == Enum.UserInputType.Keyboard then
+			if input.KeyCode == InputManager.currentKey and InputManager.inputMode == "Hold" then
+				-- stop flying when key released
+				if FlyController.isFlying() then FlyController.disable(); setUIFlying(false) end
+			end
+		end
+	end)
+	watch(kbUpConn)
+
+	-- slider input handling (global InputChanged)
+	local ic = UserInputService.InputChanged:Connect(function(input)
+		if not sliderDragging then return end
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+			local track = sliderDragging
+			local trackWidth = track.AbsoluteSize.X
+			if trackWidth <= 0 then return end
 			local percent = (input.Position.X - track.AbsolutePosition.X) / trackWidth
-			local minValue, maxValue
-			if track.Name == "Fly SpeedSlider" then minValue, maxValue = SPEED_MIN, SPEED_MAX
-			elseif track.Name == "JumpPowerSlider" then minValue, maxValue = JUMP_MIN, JUMP_MAX
-			else minValue, maxValue = WALK_MIN, WALK_MAX end
-			local value = math.floor(minValue + math.clamp(percent,0,1) * (maxValue - minValue) + 0.5)
-			-- Update by simulating the setValueFromPercent used on creation:
-			for _, obj in ipairs(track.Parent:GetChildren()) do end -- (keeps compatibility)
-			local percentValue = (value - minValue) / math.max(1, (maxValue - minValue))
+			percent = Utils.clamp(percent, 0, 1)
+			-- determine which slider
+			local name = track.Name
+			local val
+			if name == "Fly SpeedSlider" then
+				val = math.floor(LIMITS.Speed.min + percent * (LIMITS.Speed.max - LIMITS.Speed.min) + 0.5)
+				-- update UI fill/thumb
+				local thumb = track:FindFirstChildOfClass("TextButton")
+				local fill = track:FindFirstChildOfClass("Frame")
+				if thumb then thumb.Position = UDim2.new(0, percent * trackWidth, 0.5, 0) end
+				if fill then fill.Size = UDim2.new(percent, 0, 1, 0) end
+				self.config.FlySpeed = val
+			elseif name == "JumpPowerSlider" then
+				val = math.floor(LIMITS.Jump.min + percent * (LIMITS.Jump.max - LIMITS.Jump.min) + 0.5)
+				local thumb = track:FindFirstChildOfClass("TextButton")
+				local fill = track:FindFirstChildOfClass("Frame")
+				if thumb then thumb.Position = UDim2.new(0, percent * trackWidth, 0.5, 0) end
+				if fill then fill.Size = UDim2.new(percent, 0, 1, 0) end
+				self.config.JumpPower = val
+			elseif name == "WalkSpeedSlider" then
+				val = math.floor(LIMITS.Walk.min + percent * (LIMITS.Walk.max - LIMITS.Walk.min) + 0.5)
+				local thumb = track:FindFirstChildOfClass("TextButton")
+				local fill = track:FindFirstChildOfClass("Frame")
+				if thumb then thumb.Position = UDim2.new(0, percent * trackWidth, 0.5, 0) end
+				if fill then fill.Size = UDim2.new(percent, 0, 1, 0) end
+				self.config.WalkSpeed = val
+			end
+			-- apply to humanoid
+			local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+			if humanoid then
+				if self.config.JumpPower then humanoid.UseJumpPower = true; humanoid.JumpPower = self.config.JumpPower end
+				if self.config.WalkSpeed then humanoid.WalkSpeed = self.config.WalkSpeed end
+			end
+			-- save config
+			SettingsManager.saveConfig(self.config)
+		end
+	end)
+	watch(ic)
+
+	-- InputEnded for slider drag stop
+	local ie = UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			sliderDragging = nil
+		end
+	end)
+	watch(ie)
+
+	-- attach InputBegan listeners to sliders (we created them in UIFactory)
+	-- We need to find the track frames and attach InputBegan to update sliderDragging variable
+	local function attachSliderListeners(sliderFrame)
+		if not sliderFrame then return end
+		local track = sliderFrame:GetTrack()
+		if track then
+			track.InputBegan:Connect(function(inp)
+				if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+					sliderDragging = track
+					-- simulate immediate update
+					local pos = inp.Position
+					local trackWidth = track.AbsoluteSize.X
+					if trackWidth > 0 then
+						local percent = (pos.X - track.AbsolutePosition.X) / trackWidth
+						percent = Utils.clamp(percent, 0, 1)
+						-- call InputChanged manually by setting sliderDragging and using InputChanged handler above (works on next movement)
+					end
+				end
+			end)
 			local thumb = track:FindFirstChildOfClass("TextButton")
-			local fill = track:FindFirstChildOfClass("Frame")
-			if thumb then thumb.Position = UDim2.new(0, percentValue * trackWidth, 0.5, 0) end
-			if fill then fill.Size = UDim2.new(percentValue, 0, 1, 0) end
-			-- update actual values
-			if track.Name == "Fly SpeedSlider" then FLY_SPEED = value
-			elseif track.Name == "JumpPowerSlider" then jumpPowerValue = value
-			else walkSpeedValue = value end
-			applyCharacterValues()
-			saveSettings()
+			if thumb then
+				thumb.InputBegan:Connect(function(inp)
+					if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+						sliderDragging = track
+					end
+				end)
+			end
 		end
 	end
-end)
-addConn(inputChangedConn)
+	attachSliderListeners(self.flySlider)
+	attachSliderListeners(self.jumpSlider)
+	attachSliderListeners(self.walkSlider)
 
-UserInputService.InputEnded:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-		sliderDragging = nil
-	end
-end)
-addConn(UserInputService.InputEnded)
+	-- Minimize button
+	self.minBtn.Activated:Connect(function()
+		if self.panel.Visible and not self.panel:IsDescendantOf(game) then return end
+		if self.panel.Visible then
+			-- store position
+			self.savedPanelPosition = self.panel.Position
+			-- compute bubble pos near panel corner
+			local abs = self.panel.AbsolutePosition
+			local bw = self.bubble.AbsoluteSize.X
+			local vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1280,720)
+			local bx = math.clamp(abs.X + self.panel.AbsoluteSize.X - bw - 8, 8, vp.X - bw - 8)
+			local by = math.clamp(abs.Y + 8, 8, vp.Y - self.bubble.AbsoluteSize.Y - 8)
+			self.bubble.Position = UDim2.new(0, bx, 0, by)
+			self.bubble.Visible = true
+			Utils.tween(self.panel, {Size = UDim2.new(0.16,0,0.1,0)}, 0.18)
+			task.delay(0.18, function()
+				self.panel.Visible = false
+				self.panel.Size = UDim2.new(0.24,0,0.55,0)
+			end)
+		else
+			-- restore
+			self.panel.Position = self.savedPanelPosition or UDim2.new(0.02,0,0.22,0)
+			self.panel.Visible = true
+			self.bubble.Visible = false
+		end
+	end)
 
--- Dragging panel (titleBar)
-local draggingPanel = false
-local dragStart, panelStart = nil, nil
-titleBar.InputBegan:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-		draggingPanel = true
-		dragStart = input.Position
-		panelStart = panel.Position
-	end
-end)
-addConn(titleBar.InputBegan)
-local panelChangedConn = UserInputService.InputChanged:Connect(function(input)
-	if draggingPanel and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-		local delta = input.Position - dragStart
-		panel.Position = UDim2.new(panelStart.X.Scale, panelStart.X.Offset + delta.X, panelStart.Y.Scale, panelStart.Y.Offset + delta.Y)
-	end
-end)
-addConn(panelChangedConn)
-UserInputService.InputEnded:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-		draggingPanel = false
-	end
-end)
-addConn(UserInputService.InputEnded)
-
--- ===== Minimizar / bubble com snap =====
--- Bubble creation (pixel size, mas posicionada com base na viewport)
-local bubble = Instance.new("TextButton", screenGui)
-bubble.Name = "MinimizedBubble"
-bubble.Size = UDim2.new(0, 64, 0, 64)
-bubble.BackgroundColor3 = Color3.fromRGB(100,100,240)
-bubble.Position = UDim2.new(panel.Position.X.Scale, panel.AbsolutePosition.X + panel.AbsoluteSize.X - 72, panel.Position.Y.Scale, panel.AbsolutePosition.Y + 12)
-bubble.Text = "⦿"
-bubble.Font = Enum.Font.GothamBold
-bubble.TextSize = 32
-bubble.TextColor3 = Color3.fromRGB(255,255,255)
-bubble.BorderSizePixel = 0
-bubble.Visible = false
-bubble.AutoButtonColor = false
-local bubbleCorner = Instance.new("UICorner", bubble)
-bubbleCorner.CornerRadius = UDim.new(1, 0)
-
--- dragging bubble
-local draggingBubble = false
-local bubbleDragStart, bubbleStartPosition = nil, nil
-
-bubble.InputBegan:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-		draggingBubble = true
-		bubbleDragStart = input.Position
-		bubbleStartPosition = bubble.Position
-	end
-end)
-addConn(bubble.InputBegan)
-
-local bubbleInputChangedConn = UserInputService.InputChanged:Connect(function(input)
-	if draggingBubble and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-		local delta = input.Position - bubbleDragStart
-		local newPos = UDim2.new(bubbleStartPosition.X.Scale, bubbleStartPosition.X.Offset + delta.X, bubbleStartPosition.Y.Scale, bubbleStartPosition.Y.Offset + delta.Y)
-		-- clamp to screen
-		local vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1280,720)
-		local ox = math.clamp(newPos.X.Offset, 8, vp.X - bubble.AbsoluteSize.X - 8)
-		local oy = math.clamp(newPos.Y.Offset, 8, vp.Y - bubble.AbsoluteSize.Y - 8)
-		bubble.Position = UDim2.new(0, ox, 0, oy)
-	end
-end)
-addConn(bubbleInputChangedConn)
-
-UserInputService.InputEnded:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-		if draggingBubble then
+	-- Bubble drag & snap
+	local draggingBubble = false
+	local bubbleStartPos, bubbleDragStart = nil, nil
+	self.bubble.InputBegan:Connect(function(inp)
+		if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+			draggingBubble = true
+			bubbleDragStart = inp.Position
+			bubbleStartPos = self.bubble.Position
+		end
+	end)
+	local bubbleChangedConn = UserInputService.InputChanged:Connect(function(inp)
+		if draggingBubble and (inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch) then
+			local delta = inp.Position - bubbleDragStart
+			local newX = bubbleStartPos.X.Offset + delta.X
+			local newY = bubbleStartPos.Y.Offset + delta.Y
+			local vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1280,720)
+			local ox = math.clamp(newX, 8, vp.X - self.bubble.AbsoluteSize.X - 8)
+			local oy = math.clamp(newY, 8, vp.Y - self.bubble.AbsoluteSize.Y - 8)
+			self.bubble.Position = UDim2.new(0, ox, 0, oy)
+		end
+	end)
+	watch(bubbleChangedConn)
+	UserInputService.InputEnded:Connect(function(inp)
+		if draggingBubble and (inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch) then
 			-- snap to nearest edge
 			local vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1280,720)
-			local centerX = bubble.AbsolutePosition.X + bubble.AbsoluteSize.X/2
-			local centerY = bubble.AbsolutePosition.Y + bubble.AbsoluteSize.Y/2
+			local centerX = self.bubble.AbsolutePosition.X + self.bubble.AbsoluteSize.X/2
+			local centerY = self.bubble.AbsolutePosition.Y + self.bubble.AbsoluteSize.Y/2
 			local leftDist = centerX
 			local rightDist = vp.X - centerX
 			local topDist = centerY
 			local bottomDist = vp.Y - centerY
 			local minEdge = math.min(leftDist, rightDist, topDist, bottomDist)
-			local targetX, targetY = bubble.AbsolutePosition.X, bubble.AbsolutePosition.Y
+			local targetX, targetY = self.bubble.AbsolutePosition.X, self.bubble.AbsolutePosition.Y
 			if minEdge == leftDist then
 				targetX = 8
 			elseif minEdge == rightDist then
-				targetX = vp.X - bubble.AbsoluteSize.X - 8
+				targetX = vp.X - self.bubble.AbsoluteSize.X - 8
 			elseif minEdge == topDist then
 				targetY = 8
 			else
-				targetY = vp.Y - bubble.AbsoluteSize.Y - 8
+				targetY = vp.Y - self.bubble.AbsoluteSize.Y - 8
 			end
-			TweenService:Create(bubble, TweenInfo.new(0.18, Enum.EasingStyle.Quad), {Position = UDim2.new(0, targetX, 0, targetY)}):Play()
+			Utils.tween(self.bubble, {Position = UDim2.new(0, targetX, 0, targetY)}, 0.18)
 		end
 		draggingBubble = false
+	end)
+
+	-- bubble click restores
+	self.bubble.Activated:Connect(function() 
+		self.panel.Visible = true
+		self.bubble.Visible = false
+	end)
+
+	-- set keybind recording UI
+	self.keyBtn.Activated:Connect(function()
+		-- start recording next key
+		self.keyBtn.Text = "Pressione uma tecla..."
+		InputManager.startRecord(function(key)
+			-- update current key and config, save
+			self.config.ToggleKey = tostring(key.Name)
+			InputManager.currentKey = key
+			-- update text
+			self.keyBtn.Text = tostring(key.Name)
+			-- save config
+			SettingsManager.saveConfig(self.config)
+		end)
+	end)
+
+	-- mode toggle between Toggle/Hold
+	self.modeToggle.Activated:Connect(function()
+		if InputManager.inputMode == "Toggle" then
+			InputManager.inputMode = "Hold"
+			self.modeToggle.Text = "H"
+		else
+			InputManager.inputMode = "Toggle"
+			self.modeToggle.Text = "T"
+		end
+		self.config.InputMode = InputManager.inputMode
+		SettingsManager.saveConfig(self.config)
+	end)
+
+	-- Save preset
+	self.savePresetBtn.Activated:Connect(function()
+		local name = tostring(self.presetInput.Text or ""):gsub("^%s*(.-)%s*$","%1")
+		if name == "" then
+			-- quick feedback
+			self.presetInput.Text = ""
+			self.presetInput.PlaceholderText = "Informe um nome válido"
+			task.delay(1.2, function() if self.presetInput then self.presetInput.PlaceholderText = "Nome do preset" end end)
+			return
+		end
+		local preset = {
+			FlySpeed = self.config.FlySpeed or DEFAULTS.FlySpeed,
+			JumpPower = self.config.JumpPower or DEFAULTS.JumpPower,
+			WalkSpeed = self.config.WalkSpeed or DEFAULTS.WalkSpeed,
+			SprintMult = self.config.SprintMult or DEFAULTS.SprintMult,
+			ToggleKey = tostring(InputManager.currentKey.Name),
+			InputMode = InputManager.inputMode
+		}
+		SettingsManager.savePreset(name, preset)
+		self:refreshPresetButtons()
+		self.presetInput.Text = ""
+	end)
+
+	-- preset buttons refresh
+	function self:refreshPresetButtons()
+		-- clear children
+		for _,c in ipairs(self.presetList:GetChildren()) do
+			if not c:IsA("UIListLayout") then pcall(function() c:Destroy() end) end
+		end
+		local presets = SettingsManager.getPresets()
+		for name, data in pairs(presets) do
+			local btn = Instance.new("TextButton", self.presetList)
+			btn.Size = UDim2.new(0, 120, 0, 36)
+			btn.BackgroundColor3 = Color3.fromRGB(240,240,245)
+			btn.Text = name
+			btn.Font = Enum.Font.Gotham
+			btn.TextScaled = true
+			btn.AutoButtonColor = false
+			local btnCorner = Instance.new("UICorner", btn)
+			btn.Activated:Connect(function()
+				-- load preset
+				self.config.FlySpeed = data.FlySpeed or self.config.FlySpeed
+				self.config.JumpPower = data.JumpPower or self.config.JumpPower
+				self.config.WalkSpeed = data.WalkSpeed or self.config.WalkSpeed
+				self.config.SprintMult = data.SprintMult or self.config.SprintMult
+				-- key & mode
+				local keyname = data.ToggleKey
+				if keyname and type(keyname) == "string" then
+					local ok, enum = pcall(function() return Enum.KeyCode[keyname] end)
+					if ok and enum then InputManager.currentKey = enum end
+				end
+				InputManager.inputMode = data.InputMode or InputManager.inputMode
+				-- apply to UI
+				self.keyBtn.Text = tostring(InputManager.currentKey.Name)
+				self.modeToggle.Text = (InputManager.inputMode == "Hold") and "H" or "T"
+				-- update sliders visually
+				if self.config.FlySpeed then
+					local p = (self.config.FlySpeed - LIMITS.Speed.min)/math.max(1, (LIMITS.Speed.max - LIMITS.Speed.min))
+					self.flySlider.SetValueFromPercent(p)
+				end
+				if self.config.JumpPower then
+					local p = (self.config.JumpPower - LIMITS.Jump.min)/math.max(1, (LIMITS.Jump.max - LIMITS.Jump.min))
+					self.jumpSlider.SetValueFromPercent(p)
+				end
+				if self.config.WalkSpeed then
+					local p = (self.config.WalkSpeed - LIMITS.Walk.min)/math.max(1, (LIMITS.Walk.max - LIMITS.Walk.min))
+					self.walkSlider.SetValueFromPercent(p)
+				end
+				-- apply to humanoid now
+				local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+				if humanoid then
+					if self.config.JumpPower then humanoid.UseJumpPower = true; humanoid.JumpPower = self.config.JumpPower end
+					if self.config.WalkSpeed then humanoid.WalkSpeed = self.config.WalkSpeed end
+				end
+				-- save config
+				SettingsManager.saveConfig(self.config)
+			end)
+			-- right-click for delete/rename (simple: double click to delete)
+			local lastClick = 0
+			btn.MouseButton1Click:Connect(function()
+				local now = tick()
+				if now - lastClick < 0.4 then
+					-- double click -> delete
+					SettingsManager.deletePreset(name)
+					self:refreshPresetButtons()
+				end
+				lastClick = now
+			end)
+		end
 	end
-end)
-addConn(UserInputService.InputEnded)
 
--- Minimize / Restore functions
-local tweenInfo = TweenInfo.new(0.18, Enum.EasingStyle.Quad)
-local function minimizePanel()
-	if minimized then return end
-	savedPanelPosition = panel.Position
-	-- position bubble close to panel corner
-	local abs = panel.AbsolutePosition
-	local bw = bubble.AbsoluteSize.X
-	bubble.Position = UDim2.new(0, math.clamp(abs.X + panel.AbsoluteSize.X - bw - 8, 8, workspace.CurrentCamera.ViewportSize.X - bw - 8), 0, math.clamp(abs.Y + 8, 8, workspace.CurrentCamera.ViewportSize.Y - bubble.AbsoluteSize.Y - 8))
-	bubble.Visible = true
-	-- animate panel shrink then hide
-	local shrink = TweenService:Create(panel, tweenInfo, {Size = UDim2.new(0.16,0,0.1,0)})
-	shrink:Play()
-	task.delay(0.18, function()
-		panel.Visible = false
-		panel.Size = UDim2.new(0.24,0,0.55,0) -- restore size so next open is normal
+	-- scroll arrows behavior
+	self.content:GetPropertyChangedSignal("CanvasPosition"):Connect(function() self:updateScrollArrows() end)
+	self.content:GetPropertyChangedSignal("CanvasSize"):Connect(function() self:updateScrollArrows() end)
+	self.upArrow.Activated:Connect(function()
+		-- scroll up a page
+		local ypos = math.max(0, self.content.CanvasPosition.Y - self.content.AbsoluteWindowSize.Y + 40)
+		self.content.CanvasPosition = Vector2.new(0, ypos)
 	end)
-	minimized = true
-end
-
-local function restorePanel()
-	if not minimized then return end
-	panel.Position = savedPanelPosition or UDim2.new(0.02,0,0.22,0)
-	panel.Visible = true
-	bubble.Visible = false
-	minimized = false
-end
-
-minimizeButton.Activated:Connect(function() 
-	if minimized then restorePanel() else minimizePanel() end
-end)
-addConn(minimizeButton.Activated)
-
-bubble.Activated:Connect(function() restorePanel() end)
-addConn(bubble.Activated)
-
--- Hover animations for important buttons (toggle & minimize)
-local function addHoverTweens(btn)
-	btn.MouseEnter:Connect(function()
-		TweenService:Create(btn, TweenInfo.new(0.12), {BackgroundColor3 = btn.BackgroundColor3:Lerp(Color3.fromRGB(220,220,230), 0.35)}):Play()
+	self.downArrow.Activated:Connect(function()
+		local ypos = math.min(math.max(0, self.content.CanvasSize.Y.Offset - self.content.AbsoluteWindowSize.Y), self.content.CanvasPosition.Y + self.content.AbsoluteWindowSize.Y - 40)
+		self.content.CanvasPosition = Vector2.new(0, ypos)
 	end)
-	btn.MouseLeave:Connect(function()
-		TweenService:Create(btn, TweenInfo.new(0.12), {BackgroundColor3 = btn.BackgroundColor3}):Play()
+
+	-- update arrows initial
+	self:updateScrollArrows()
+
+	-- cleanup on GUI destroy
+	self.screenGui.Destroying:Connect(function()
+		-- stop flying & restore collisions
+		if FlyController.isFlying() then FlyController.disable() end
+		-- cleanup any connections
+		for _,c in ipairs(self.connections) do
+			if c and typeof(c) == "RBXScriptConnection" and c.Connected then c:Disconnect() end
+		end
 	end)
 end
-addHoverTweens(toggleButton)
-addHoverTweens(minimizeButton)
-addHoverTweens(bubble)
 
--- Save settings when slider values are changed by using saveSettings() already called in slider callbacks
+-- update scroll arrows function
+function Controller:updateScrollArrows()
+	local content = self.content
+	if not content or not content:IsA("ScrollingFrame") then return end
+	-- short delay for layout stabilization
+	task.defer(function()
+		local canScroll = content.CanvasSize.Y.Offset > content.AbsoluteWindowSize.Y + 4
+		if not canScroll then
+			self.upArrow.Visible = false
+			self.downArrow.Visible = false
+			return
+		end
+		local y = content.CanvasPosition.Y
+		local maxY = math.max(0, content.CanvasSize.Y.Offset - content.AbsoluteWindowSize.Y)
+		self.upArrow.Visible = (y > 2)
+		self.downArrow.Visible = (y < maxY - 2)
+	end)
+end
 
--- Load settings on start
-loadSettings()
-applyCharacterValues()
+-- =========================
+-- Inicialização
+-- =========================
+local controller = {}
+setmetatable(controller, {__index = Controller})
+controller:init()
 
--- UI cleanup on destroy
-screenGui.Destroying:Connect(function()
-	-- restore collisions if needed
-	restoreCharacterCollisions()
-	cleanupConnections()
-end)
+-- Save current slider values periodically or on change (we saved on slider updates already)
+-- Ensure config gets saved when changing sliders via UI by calling SettingsManager.saveConfig when values change.
+-- For safety, ensure config has keys set from UI on start
+local function syncConfigFromUI()
+	controller.config.FlySpeed = controller.config.FlySpeed or DEFAULTS.FlySpeed
+	controller.config.JumpPower = controller.config.JumpPower or DEFAULTS.JumpPower
+	controller.config.WalkSpeed = controller.config.WalkSpeed or DEFAULTS.WalkSpeed
+	controller.config.SprintMult = controller.config.SprintMult or DEFAULTS.SprintMult
+	controller.config.ToggleKey = controller.config.ToggleKey or tostring(InputManager.currentKey.Name)
+	controller.config.InputMode = controller.config.InputMode or InputManager.inputMode
+	SettingsManager.saveConfig(controller.config)
+end
+syncConfigFromUI()
 
--- Final: expose some convenience to console (optional)
+-- Expose global convenience for dev console
 _G.FlyControl = {
-	Enable = enableFly,
-	Disable = disableFly,
-	Toggle = toggleFly,
-	IsFlying = function() return flying end,
-	SaveSettings = saveSettings,
-	LoadSettings = loadSettings
+	Enable = function() FlyController.enable() end,
+	Disable = function() FlyController.disable() end,
+	Toggle = function() if FlyController.isFlying() then FlyController.disable() else FlyController.enable() end end,
+	IsFlying = function() return FlyController.isFlying() end,
+	SaveSettings = function() SettingsManager.saveConfig(controller.config) end,
+	LoadSettings = function() controller.config = SettingsManager.loadConfig(); controller:applyConfigToUI() end,
+	SettingsManager = SettingsManager
 }
+
+print("[FlyControl] UI loaded. Use _G.FlyControl.Toggle() to test from console.")
