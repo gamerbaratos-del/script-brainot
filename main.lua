@@ -625,12 +625,6 @@ local function setupInputHandling()
 		dragArea.InputBegan:Connect(function(input)
 			if input.UserInputType == Enum.UserInputType.MouseButton1 or 
 			   input.UserInputType == Enum.UserInputType.Touch then
-				-- Se estiver minimizado e clicou na bolinha, expande
-				if flyState.minimized and dragArea == uiElements.panel then
-					toggleMinimize()
-					return
-				end
-
 				flyState.draggingPanel = true
 				flyState.dragStart = input.Position
 				flyState.panelStart = uiElements.panel.Position
