@@ -141,6 +141,7 @@ local function toggleMinimize()
 		uiElements.minimizeButton.Size = UDim2.new(1, 0, 1, 0)
 		uiElements.minimizeButton.Position = UDim2.new(0, 0, 0, 0)
 		uiElements.minimizeButton.BackgroundColor3 = Color3.fromRGB(100, 150, 255)
+		uiElements.minimizeButton.ZIndex = 5
 		
 	else
 		-- Expandir para painel normal - volta para posição salva
@@ -166,6 +167,7 @@ local function toggleMinimize()
 		uiElements.minimizeButton.Size = UDim2.new(0, 30, 0, 30)
 		uiElements.minimizeButton.Position = UDim2.new(1, -40, 0, 6)
 		uiElements.minimizeButton.BackgroundColor3 = Color3.fromRGB(240, 100, 100)
+		uiElements.minimizeButton.ZIndex = 10
 	end
 end
 
@@ -257,6 +259,10 @@ local function createUI()
 			TweenService:Create(minimizeButton, TweenInfo.new(0.2), {
 				BackgroundColor3 = Color3.fromRGB(255, 120, 120)
 			}):Play()
+		else
+			TweenService:Create(minimizeButton, TweenInfo.new(0.2), {
+				BackgroundColor3 = Color3.fromRGB(120, 170, 255)
+			}):Play()
 		end
 	end)
 
@@ -264,6 +270,10 @@ local function createUI()
 		if not flyState.minimized then
 			TweenService:Create(minimizeButton, TweenInfo.new(0.2), {
 				BackgroundColor3 = Color3.fromRGB(240, 100, 100)
+			}):Play()
+		else
+			TweenService:Create(minimizeButton, TweenInfo.new(0.2), {
+				BackgroundColor3 = Color3.fromRGB(100, 150, 255)
 			}):Play()
 		end
 	end)
